@@ -360,3 +360,21 @@ class Model(nn.Module):
             )
 
         return self.model(batch_x, future_z=future_z)
+    
+    @torch.no_grad()
+    def mc_predict(self, batch_x, future_z=None, mc_samples: int = 20):
+        # Accept either [B, L, C] (repo default) or [B, C, L]
+        if batch_x.ndim != 3:
+            raise ValueError(f"Unexpected input rank {batch_x.ndim}; expected 3")
+        B, D1, D2 = batch_x.shape
+        if D1 == self.context_window and D2 == self.c_in:
+            batch_x = batch_x.permute(0, 2, 1).contiguous()  # -> [B, C, L]
+        elif D1 == self.c_in:
+            pass
+        else:
+            raise ValueError(
+                f"Unexpected input shape {tuple(batch_x.shape)}; "
+                f"expected [B, L, {self.c_in}] or [B, {self.c_in}, L] with L={self.context_window}"
+            )
+        return self.model.mc_predict(batch_x, future_z=future_z, mc_samples=mc_samples)
+
