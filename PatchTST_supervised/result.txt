@@ -1,0 +1,6 @@
+BasePatchTST_96_PatchTST_ETTm1_ftM_sl336_ll168_pl96_dm128_nh16_el3_dl1_df256_fc1_ebtimeF_dtTrue_test_0  
+mse:0.29194095730781555, mae:0.34316977858543396, rse:0.5139666795730591
+
+BasePatchTST_96_PatchTST_ETTm1_ftM_sl336_ll168_pl96_dm128_nh16_el3_dl1_df256_fc1_ebtimeF_dtTrue_test_1  
+mse:0.2862967252731323, mae:0.3424874246120453, rse:0.508974015712738
+
