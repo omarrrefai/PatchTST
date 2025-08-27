@@ -1,0 +1,6 @@
+EnergyPatchTST_96_noZ_EnergyPatchTST_ETTm1_ftM_sl336_ll168_pl96_dm128_nh16_el3_dl1_df256_fc1_ebtimeF_dtTrue_test_0  
+mse:0.7944164872169495, mae:0.7001678347587585, rse:0.8478354811668396
+
+EnergyPatchTST_96_noZ_EnergyPatchTST_ETTm1_ftM_sl336_ll168_pl96_dm128_nh16_el3_dl1_df256_fc1_ebtimeF_dtTrue_test_1  
+mse:0.7942582368850708, mae:0.700569748878479, rse:0.8477509617805481
+
