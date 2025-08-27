@@ -15,7 +15,7 @@ if __name__ == '__main__':
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='Autoformer',
-                        help='model name, options: [Autoformer, Informer, Transformer]')
+                        help='model name, options: [Autoformer, Informer, Transformer, DLinear, Linear, NLinear, PatchTST, EnergyPatchTST]')
 
     # data loader
     parser.add_argument('--data', type=str, required=True, default='ETTm1', help='dataset type')
@@ -32,6 +32,14 @@ if __name__ == '__main__':
     parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')
     parser.add_argument('--label_len', type=int, default=48, help='start token length')
     parser.add_argument('--pred_len', type=int, default=96, help='prediction sequence length')
+
+    # model define
+    parser.add_argument('--scales', type=int, nargs='+', default=[1, 24, 168])
+    parser.add_argument('--future_dim', type=int, default=0)        # E (0 = no future path)
+    parser.add_argument('--future_proj_dim', type=int, default=128)
+    parser.add_argument('--nll_lambda', type=float, default=1.0)    # weight for NLL term
+    parser.add_argument('--mc_samples', type=int, default=0, help='MC-dropout samples at test time')
+    parser.add_argument('--attn_dropout', type=float, default=0.0, help='attention dropout for PatchTST-style models')
 
 
     # DLinear
@@ -104,7 +112,7 @@ if __name__ == '__main__':
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 
     if args.use_gpu and args.use_multi_gpu:
-        args.dvices = args.devices.replace(' ', '')
+        args.devices = args.devices.replace(' ', '')
         device_ids = args.devices.split(',')
         args.device_ids = [int(id_) for id_ in device_ids]
         args.gpu = args.device_ids[0]

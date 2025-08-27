@@ -1,12 +1,13 @@
 from data_provider.data_factory import data_provider
 from exp.exp_basic import Exp_Basic
-from models import Informer, Autoformer, Transformer, DLinear, Linear, NLinear, PatchTST
+from models import Informer, Autoformer, Transformer, DLinear, Linear, NLinear, PatchTST, EnergyPatchTST
 from utils.tools import EarlyStopping, adjust_learning_rate, visual, test_params_flop
 from utils.metrics import metric
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import optim
 from torch.optim import lr_scheduler 
 
@@ -32,6 +33,8 @@ class Exp_Main(Exp_Basic):
             'NLinear': NLinear,
             'Linear': Linear,
             'PatchTST': PatchTST,
+            # FIX: correct key so --model EnergyPatchTST finds the class
+            'EnergyPatchTST': EnergyPatchTST,
         }
         model = model_dict[self.args.model].Model(self.args).float()
 
@@ -48,8 +51,37 @@ class Exp_Main(Exp_Basic):
         return model_optim
 
     def _select_criterion(self):
-        criterion = nn.MSELoss()
-        return criterion
+        # Probabilistic head for EnergyPatchTST uses Gaussian NLL in addition to MSE
+        if getattr(self.args, 'model', '') == 'EnergyPatchTST':
+            return nn.GaussianNLLLoss(full=True)
+        return nn.MSELoss()
+
+    def _forward_and_loss_energy(self, batch_x, batch_y, batch_y_mark, criterion):
+        """Forward + loss for EnergyPatchTST. Returns (outputs_for_metrics, loss)
+        outputs_for_metrics shape: [B, H, C] to stay compatible with existing code paths.
+        """
+        # Optional known future covariates path
+        future_z = None
+        E = int(getattr(self.args, 'future_dim', 0) or 0)
+        if E > 0:
+            # Use the last pred_len steps of known marks as future features; take first E dims
+            future_z = batch_y_mark[:, -self.args.pred_len:, :E]
+        # Model returns (mu, log_var) as [B, C, H] each
+        mu, log_var = self.model(batch_x, future_z=future_z)
+
+        # Targets as [B, C, H]
+        f_dim = -1 if self.args.features == 'MS' else 0
+        target_bhc = batch_y[:, -self.args.pred_len:, f_dim:].permute(0, 2, 1).contiguous()
+
+        # Combined loss: MSE + lambda * NLL
+        mse = F.mse_loss(mu, target_bhc)
+        nll = criterion(mu, target_bhc, torch.exp(log_var))
+        lam = float(getattr(self.args, 'nll_lambda', 1.0))
+        loss = mse + lam * nll
+
+        # For metric & visualization code that expects [B, H, C]
+        outputs_for_metrics = mu.permute(0, 2, 1).contiguous()
+        return outputs_for_metrics, loss
 
     def vali(self, vali_data, vali_loader, criterion):
         total_loss = []
@@ -57,42 +89,44 @@ class Exp_Main(Exp_Basic):
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
                 batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float()
-
+                batch_y = batch_y.float().to(self.device)
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
-                # decoder input
+                # decoder input (kept to preserve existing API for non-TST models)
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
-                # encoder - decoder
+
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
+                        if self.args.model == 'EnergyPatchTST':
+                            outputs, loss = self._forward_and_loss_energy(batch_x, batch_y, batch_y_mark, criterion)
+                        else:
+                            if 'Linear' in self.args.model or 'TST' in self.args.model:
+                                outputs = self.model(batch_x)
+                            else:
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0] if self.args.output_attention \
+                                    else self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                            f_dim = -1 if self.args.features == 'MS' else 0
+                            outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                            target = batch_y[:, -self.args.pred_len:, f_dim:]
+                            loss = criterion(outputs, target)
+                else:
+                    if self.args.model == 'EnergyPatchTST':
+                        outputs, loss = self._forward_and_loss_energy(batch_x, batch_y, batch_y_mark, criterion)
+                    else:
                         if 'Linear' in self.args.model or 'TST' in self.args.model:
                             outputs = self.model(batch_x)
                         else:
-                            if self.args.output_attention:
-                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                            else:
-                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                else:
-                    if 'Linear' in self.args.model or 'TST' in self.args.model:
-                        outputs = self.model(batch_x)
-                    else:
-                        if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                        else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                f_dim = -1 if self.args.features == 'MS' else 0
-                outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0] if self.args.output_attention \
+                                else self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        f_dim = -1 if self.args.features == 'MS' else 0
+                        outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                        target = batch_y[:, -self.args.pred_len:, f_dim:]
+                        loss = criterion(outputs, target)
 
-                pred = outputs.detach().cpu()
-                true = batch_y.detach().cpu()
-
-                loss = criterion(pred, true)
-
-                total_loss.append(loss)
+                # accumulate
+                total_loss.append(loss.item())
         total_loss = np.average(total_loss)
         self.model.train()
         return total_loss
@@ -138,40 +172,38 @@ class Exp_Main(Exp_Basic):
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
-                # decoder input
+                # decoder input (kept for non-TST models)
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
 
-                # encoder - decoder
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
+                        if self.args.model == 'EnergyPatchTST':
+                            outputs, loss = self._forward_and_loss_energy(batch_x, batch_y, batch_y_mark, criterion)
+                        else:
+                            if 'Linear' in self.args.model or 'TST' in self.args.model:
+                                outputs = self.model(batch_x)
+                            else:
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0] if self.args.output_attention \
+                                    else self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                            f_dim = -1 if self.args.features == 'MS' else 0
+                            outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                            target = batch_y[:, -self.args.pred_len:, f_dim:]
+                            loss = criterion(outputs, target)
+                        train_loss.append(loss.item())
+                else:
+                    if self.args.model == 'EnergyPatchTST':
+                        outputs, loss = self._forward_and_loss_energy(batch_x, batch_y, batch_y_mark, criterion)
+                    else:
                         if 'Linear' in self.args.model or 'TST' in self.args.model:
                             outputs = self.model(batch_x)
                         else:
-                            if self.args.output_attention:
-                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                            else:
-                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0] if self.args.output_attention \
+                                else self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                         f_dim = -1 if self.args.features == 'MS' else 0
                         outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                        batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-                        loss = criterion(outputs, batch_y)
-                        train_loss.append(loss.item())
-                else:
-                    if 'Linear' in self.args.model or 'TST' in self.args.model:
-                            outputs = self.model(batch_x)
-                    else:
-                        if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                            
-                        else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, batch_y)
-                    # print(outputs.shape,batch_y.shape)
-                    f_dim = -1 if self.args.features == 'MS' else 0
-                    outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                    batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-                    loss = criterion(outputs, batch_y)
+                        target = batch_y[:, -self.args.pred_len:, f_dim:]
+                        loss = criterion(outputs, target)
                     train_loss.append(loss.item())
 
                 if (i + 1) % 100 == 0:
@@ -239,12 +271,41 @@ class Exp_Main(Exp_Basic):
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
-                # decoder input
+                # decoder input (for non-TST models)
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
-                # encoder - decoder
+
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
+                        if self.args.model == 'EnergyPatchTST':
+                            # Optional MC-dropout inference
+                            mc = int(getattr(self.args, 'mc_samples', 0) or 0)
+                            E = int(getattr(self.args, 'future_dim', 0) or 0)
+                            future_z = batch_y_mark[:, -self.args.pred_len:, :E] if E > 0 else None
+                            if mc > 0:
+                                mean_mu, total_var = self.model.mc_predict(batch_x, future_z=future_z, mc_samples=mc)
+                                outputs = mean_mu.permute(0, 2, 1).contiguous()  # [B, H, C]
+                            else:
+                                mu, log_var = self.model(batch_x, future_z=future_z)
+                                outputs = mu.permute(0, 2, 1).contiguous()
+                        else:
+                            if 'Linear' in self.args.model or 'TST' in self.args.model:
+                                outputs = self.model(batch_x)
+                            else:
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0] if self.args.output_attention \
+                                    else self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                else:
+                    if self.args.model == 'EnergyPatchTST':
+                        mc = int(getattr(self.args, 'mc_samples', 0) or 0)
+                        E = int(getattr(self.args, 'future_dim', 0) or 0)
+                        future_z = batch_y_mark[:, -self.args.pred_len:, :E] if E > 0 else None
+                        if mc > 0:
+                            mean_mu, total_var = self.model.mc_predict(batch_x, future_z=future_z, mc_samples=mc)
+                            outputs = mean_mu.permute(0, 2, 1).contiguous()
+                        else:
+                            mu, log_var = self.model(batch_x, future_z=future_z)
+                            outputs = mu.permute(0, 2, 1).contiguous()
+                    else:
                         if 'Linear' in self.args.model or 'TST' in self.args.model:
                             outputs = self.model(batch_x)
                         else:
@@ -252,33 +313,23 @@ class Exp_Main(Exp_Basic):
                                 outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
                             else:
                                 outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                else:
-                    if 'Linear' in self.args.model or 'TST' in self.args.model:
-                            outputs = self.model(batch_x)
-                    else:
-                        if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-
-                        else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
                 f_dim = -1 if self.args.features == 'MS' else 0
-                # print(outputs.shape,batch_y.shape)
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                batch_y = batch_y[:, -self.args.pred_len:, f_dim:]
                 outputs = outputs.detach().cpu().numpy()
                 batch_y = batch_y.detach().cpu().numpy()
 
-                pred = outputs  # outputs.detach().cpu().numpy()  # .squeeze()
-                true = batch_y  # batch_y.detach().cpu().numpy()  # .squeeze()
+                pred = outputs
+                true = batch_y
 
                 preds.append(pred)
                 trues.append(true)
                 inputx.append(batch_x.detach().cpu().numpy())
                 if i % 20 == 0:
-                    input = batch_x.detach().cpu().numpy()
-                    gt = np.concatenate((input[0, :, -1], true[0, :, -1]), axis=0)
-                    pd = np.concatenate((input[0, :, -1], pred[0, :, -1]), axis=0)
+                    _input = batch_x.detach().cpu().numpy()
+                    gt = np.concatenate((_input[0, :, -1], true[0, :, -1]), axis=0)
+                    pd = np.concatenate((_input[0, :, -1], pred[0, :, -1]), axis=0)
                     visual(gt, pd, os.path.join(folder_path, str(i) + '.pdf'))
 
         if self.args.test_flop:
@@ -306,10 +357,7 @@ class Exp_Main(Exp_Basic):
         f.write('\n')
         f.close()
 
-        # np.save(folder_path + 'metrics.npy', np.array([mae, mse, rmse, mape, mspe,rse, corr]))
         np.save(folder_path + 'pred.npy', preds)
-        # np.save(folder_path + 'true.npy', trues)
-        # np.save(folder_path + 'x.npy', inputx)
         return
 
     def predict(self, setting, load=False):
@@ -330,28 +378,36 @@ class Exp_Main(Exp_Basic):
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
-                # decoder input
+                # decoder input (for non-TST models)
                 dec_inp = torch.zeros([batch_y.shape[0], self.args.pred_len, batch_y.shape[2]]).float().to(batch_y.device)
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
-                # encoder - decoder
+
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
+                        if self.args.model == 'EnergyPatchTST':
+                            E = int(getattr(self.args, 'future_dim', 0) or 0)
+                            future_z = batch_y_mark[:, -self.args.pred_len:, :E] if E > 0 else None
+                            mu, log_var = self.model(batch_x, future_z=future_z)
+                            outputs = mu.permute(0, 2, 1).contiguous()
+                        else:
+                            if 'Linear' in self.args.model or 'TST' in self.args.model:
+                                outputs = self.model(batch_x)
+                            else:
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0] if self.args.output_attention \
+                                    else self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                else:
+                    if self.args.model == 'EnergyPatchTST':
+                        E = int(getattr(self.args, 'future_dim', 0) or 0)
+                        future_z = batch_y_mark[:, -self.args.pred_len:, :E] if E > 0 else None
+                        mu, log_var = self.model(batch_x, future_z=future_z)
+                        outputs = mu.permute(0, 2, 1).contiguous()
+                    else:
                         if 'Linear' in self.args.model or 'TST' in self.args.model:
                             outputs = self.model(batch_x)
                         else:
-                            if self.args.output_attention:
-                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                            else:
-                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                else:
-                    if 'Linear' in self.args.model or 'TST' in self.args.model:
-                        outputs = self.model(batch_x)
-                    else:
-                        if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                        else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                pred = outputs.detach().cpu().numpy()  # .squeeze()
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0] if self.args.output_attention \
+                                else self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                pred = outputs.detach().cpu().numpy()
                 preds.append(pred)
 
         preds = np.array(preds)
