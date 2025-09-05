@@ -49,6 +49,8 @@ parser.add_argument('--model_id', type=int, default=1, help='id of the saved mod
 parser.add_argument('--model_type', type=str, default='based_model', help='for multivariate model or univariate model')
 # training
 parser.add_argument('--is_train', type=int, default=1, help='training the model')
+parser.add_argument('--eval_on_real_scale', type=int, default=1,
+                    help='if 1, inverse-transform preds/targets for metrics/plots')
 
 
 args = parser.parse_args()
@@ -127,7 +129,7 @@ def train_func(lr=args.lr):
                         cbs=cbs,
                         metrics=[mse]
                         )
-                        
+    learn.eval_on_real_scale = bool(args.eval_on_real_scale)
     # fit the data to the model
     learn.fit_one_cycle(n_epochs=args.n_epochs, lr_max=lr, pct_start=0.2)
 
@@ -142,6 +144,7 @@ def test_func():
     cbs = [RevInCB(dls.vars)] if args.revin else []
     cbs += [PatchCB(patch_len=args.patch_len, stride=args.stride)]
     learn = Learner(dls, model,cbs=cbs)
+    learn.eval_on_real_scale = bool(args.eval_on_real_scale)
     out  = learn.test(dls.test, weight_path=weight_path, scores=[mse,mae])         # out: a list of [pred, targ, score_values]
     return out
 

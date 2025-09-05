@@ -1,4 +1,4 @@
-
+import numpy as np
 from torch import nn
 import collections
 from collections import OrderedDict
@@ -56,3 +56,15 @@ def unwrap_model(model):
     unwrapped_model = nn.Sequential(OrderedDict(unwrapped_model))
     return unwrapped_model
     
+
+def inverse_scale_tensor(t: torch.Tensor, scaler):
+    """
+    t: [N, L, C] torch tensor (N batches concatenated)
+    scaler: sklearn scaler fit on training data
+    returns: tensor inverse-transformed on the last dimension
+    """
+    device, dtype = t.device, t.dtype
+    arr = t.detach().cpu().numpy()              # (N, L, C)
+    N, L, C = arr.shape
+    inv = scaler.inverse_transform(arr.reshape(-1, C)).reshape(N, L, C)
+    return torch.tensor(inv, device=device, dtype=dtype)

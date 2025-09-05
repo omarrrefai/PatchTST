@@ -7,6 +7,7 @@ import torch
 import time
 import numpy as np
 from pathlib import Path
+from ..utils import inverse_scale_tensor
 
 
 class TrackTimerCB(Callback):
@@ -136,8 +137,13 @@ class TrackTrainingCB(Callback):
         if len(self.metrics) == 0: self.batch_recorder['with_metrics'] = False
         # accumulate prediction and target          
         if self.batch_recorder['with_metrics']:
-            self.preds.append(self.pred.detach().cpu())
-            self.targs.append(yb.detach().cpu())
+            pred = self.pred                    # [B, pred_len, C]
+            targ = yb                           # often [B, (label_len+pred_len), C]
+            if targ.shape[1] != pred.shape[1]:
+                targ = targ[:, -pred.shape[1]:, :]   # take only forecast horizon
+
+            self.preds.append(pred.detach().cpu())
+            self.targs.append(targ.detach().cpu())
     
 
     def compute_scores(self):
@@ -150,7 +156,15 @@ class TrackTrainingCB(Callback):
         # calculate metrics if available after each epoch
         if len(self.preds) == 0: return values
         self.preds = torch.cat(self.preds)
-        self.targs = torch.cat(self.targs)        
+        self.targs = torch.cat(self.targs)    
+        dl = getattr(self.learner, 'dl', None)
+        use_real_scale = getattr(self.learner, 'eval_on_real_scale', False)
+        scaler = getattr(getattr(dl, 'dataset', object()), 'scaler', None)
+
+        if use_real_scale and scaler is not None:
+            self.preds = inverse_scale_tensor(self.preds, scaler)
+            self.targs = inverse_scale_tensor(self.targs, scaler)    
+            
         for func in self.metrics:             
             # values[func.__name__] = func(self.targs, self.preds)
             values[func.__name__] = func(self.targs, self.preds)        

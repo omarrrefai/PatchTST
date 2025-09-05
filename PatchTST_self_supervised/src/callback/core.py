@@ -87,4 +87,16 @@ class GetTestCB(Callback):
         self.preds = torch.concat(self.preds)#.detach().cpu().numpy()
         self.targets = torch.concat(self.targets)#.detach().cpu().numpy()
 
+        # inside GetTestCB.after_test()
+        dl = getattr(self.learner, 'dl', None)
+        use_real_scale = getattr(self.learner, 'eval_on_real_scale', False)
+        scaler = getattr(getattr(dl, 'dataset', object()), 'scaler', None)
 
+        # Align target to pred horizon for convenience
+        if self.targets.shape[1] != self.preds.shape[1]:
+            self.targets = self.targets[:, -self.preds.shape[1]:, :]
+
+        if use_real_scale and scaler is not None:
+            from ..utils import inverse_scale_tensor
+            self.preds = inverse_scale_tensor(self.preds, scaler)
+            self.targets = inverse_scale_tensor(self.targets, scaler)

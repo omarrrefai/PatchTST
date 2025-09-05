@@ -1,5 +1,5 @@
 # PatchTST (ICLR 2023)
-
+5be21b4d1ba242bc800f1d68da76c033
 ### This is an offical implementation of PatchTST: [A Time Series is Worth 64 Words: Long-term Forecasting with Transformers](https://arxiv.org/abs/2211.14730). 
 
 :triangular_flag_on_post: Our model has been included in [GluonTS](https://github.com/awslabs/gluonts). Special thanks to the contributor @[kashif](https://github.com/kashif)!
