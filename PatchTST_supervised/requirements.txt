@@ -3,3 +3,8 @@ matplotlib
 pandas
 scikit-learn
 torch==1.11.0
+gridstatus
+gridstatusio
+pyarrow
+openpyxl
+pytz

@@ -100,6 +100,10 @@ if __name__ == '__main__':
     parser.add_argument('--devices', type=str, default='0,1,2,3', help='device ids of multile gpus')
     parser.add_argument('--test_flop', action='store_true', default=False, help='See utils/tools for usage')
 
+    parser.add_argument('--eval_on_real_scale', type=int, default=1,
+                    help='inverse-transform preds/targets for metrics/plots')
+
+
     args = parser.parse_args()
 
     # random seed
