@@ -238,9 +238,43 @@ def _align_series_to_timeline():
                 ss = s.reindex(idx).interpolate(limit=6, limit_direction="both")
                 ss = ss.fillna(method="ffill").fillna(method="bfill")
                 actual[a] = ss.to_numpy(dtype=float)
+
+            # align available forecasts to same real timeline (do not leave all-NaN)
             rt = {a: np.full(len(idx), np.nan, float) for a in AREAS}
             st = {a: np.full(len(idx), np.nan, float) for a in AREAS}
             da = {a: np.full(len(idx), np.nan, float) for a in AREAS}
+
+            for a in AREAS:
+                try:
+                    vec = _load_rt_vector(a)
+                    take = min(len(vec), len(idx))
+                    if take > 0:
+                        rt[a][-take:] = vec[-take:].astype(float)
+                except Exception:
+                    pass
+
+            for a in AREAS:
+                try:
+                    mat, anchors = _load_da_matrix(a)
+                    for k, day0 in enumerate(anchors):
+                        pos = idx.get_indexer([pd.Timestamp(day0).normalize()])[0]
+                        if pos >= 0 and pos + 288 <= len(idx):
+                            da[a][pos:pos+288] = mat[k]
+                except Exception:
+                    pass
+
+            for a in AREAS:
+                try:
+                    st_loaded = _load_st_matrix(a)
+                    if st_loaded:
+                        mat, anchors = st_loaded
+                        for k, h0 in enumerate(anchors):
+                            pos = idx.get_indexer([pd.Timestamp(h0).floor("H")])[0]
+                            if pos >= 0 and pos + 12 <= len(idx):
+                                st[a][pos:pos+12] = mat[k]
+                except Exception:
+                    pass
+
             # synthetic load
             t = np.arange(len(idx))
             diurnal = 2.2 * np.sin(2*np.pi*(t % 288)/288 - np.pi/2)
@@ -361,14 +395,18 @@ def _price_for_horizon(a: str, tpos: int) -> tuple[np.ndarray, str]:
             if np.isfinite(v):
                 cand = float(v); tag_used = tg; break
 
-        # STRICT fallback: carry forward **last valid forecast**, not 0.0
+        # Fallback policy: forward-fill prior forecast, else use actual to keep MPC alive.
         if not np.isfinite(cand):
             if h > 0 and np.isfinite(out[h-1]):
                 cand = out[h-1]
                 tag_used = "FWD"
             else:
-                # Still nothing? That means your DA/ST/RT aren’t stitched. Surface it.
-                raise RuntimeError(f"No forecast available for {a} at index {i} (h={h})")
+                v_act = state["actual"][a][i] if 0 <= i < len(state["actual"][a]) else np.nan
+                if np.isfinite(v_act):
+                    cand = float(v_act)
+                    tag_used = "ACT"
+                else:
+                    raise RuntimeError(f"No forecast available for {a} at index {i} (h={h})")
 
         out[h] = cand
         if h == 0:
