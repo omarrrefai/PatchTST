@@ -10,8 +10,6 @@ import {
 } from "recharts";
 
 const AREAS = ["manitoba", "new-york", "ontario", "quebec_p33c", "manitoba_sk"];
-const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000/api/simulation_data.json";
-const API_BASE = import.meta.env.VITE_API_BASE ?? API_URL.replace(/\/simulation_data\.json$/, "");
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000/api";
 const API_URL = `${API_BASE}/simulation_data.json`;
 
@@ -125,16 +123,6 @@ export default function App() {
   const [page, setPage] = React.useState("operations");
   const [modeBusy, setModeBusy] = React.useState(false);
   const { data, err } = usePolling(API_URL, 5000);
-  const [modeBusy, setModeBusy] = React.useState(false);
-
-  const setMode = async (mode) => {
-    setModeBusy(true);
-    try {
-      await fetch(`${API_BASE}/mode/${mode}`, { method: "POST" });
-    } finally {
-      setModeBusy(false);
-    }
-  };
 
   const setMode = async (mode) => {
     setModeBusy(true);
