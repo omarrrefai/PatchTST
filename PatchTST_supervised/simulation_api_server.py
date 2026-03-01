@@ -101,12 +101,6 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "steps.ndjson"
 
 
-# Step logging (NDJSON) for later offline analysis/paper plots
-LOG_DIR = Path(os.getenv("PATCHTST_LOG_DIR", "logs/simulation"))
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOG_DIR / "steps.ndjson"
-
-
 # ----------------------------
 # App & state
 # ----------------------------
@@ -727,6 +721,25 @@ def run_mpc_step(tpos: int) -> dict:
     return result
 
 
+
+
+def _json_safe(obj):
+    """Recursively convert NaN/Inf floats to None for strict JSON compliance."""
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return [_json_safe(v) for v in obj.tolist()]
+    if isinstance(obj, (np.floating, float)):
+        v = float(obj)
+        return v if np.isfinite(v) else None
+    if isinstance(obj, (np.integer, int)):
+        return int(obj)
+    return obj
+
 def _append_step_log(t: int, res: dict) -> None:
     ts = state["timeline"][t]
     rec = {
@@ -869,7 +882,36 @@ def get_live():
         },
         "previous": state["history"][-2] if len(state["history"]) >= 2 else None,
     }
-    return JSONResponse(payload)
+    return JSONResponse(_json_safe(payload))
+
+
+
+
+@app.get("/api/log_status")
+def log_status():
+    return JSONResponse({
+        "logFile": str(LOG_FILE),
+        "exists": LOG_FILE.exists(),
+        "sizeBytes": int(LOG_FILE.stat().st_size) if LOG_FILE.exists() else 0,
+    })
+
+@app.get("/api/mode")
+def get_mode():
+    return JSONResponse({
+        "modeSelection": state.get("mode_selection", "auto"),
+        "activeMode": state.get("active_mode", "short"),
+        "availableModes": ["auto", "short", "medium", "long"],
+        "modeConfig": MODE_CONFIG,
+    })
+
+
+@app.post("/api/mode/{mode}")
+def set_mode(mode: str):
+    mode = mode.lower().strip()
+    if mode not in {"auto", "short", "medium", "long"}:
+        return JSONResponse({"status": "error", "message": f"Invalid mode '{mode}'"}, status_code=400)
+    state["mode_selection"] = mode
+    return JSONResponse({"status": "ok", "modeSelection": mode})
 
 
 
