@@ -124,7 +124,6 @@ SOURCE_TO_WINDOW = {
     "ST": "60m (12x5m)",
     "DA": "24h (288x5m)",
     "FWD": "carry-forward",
-    "ACT": "actual fallback",
     "?": "unknown",
 }
 
