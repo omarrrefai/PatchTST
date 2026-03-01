@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Data Center Optimization Dashboard</title>
+  <!-- Tailwind (CDN) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: { sans: ["Inter", "ui-sans-serif", "system-ui"] },
+          boxShadow: { soft: "0 4px 20px rgba(0,0,0,0.06)" }
+        }
+      }
+    }
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <!-- React, ReactDOM, Babel -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script crossorigin src="https://unpkg.com/babel-standalone@6/babel.min.js"></script>
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial; }
+    .card { @apply bg-white rounded-2xl shadow-soft p-5; }
+    .title { @apply text-sm font-semibold text-gray-500 tracking-wide; }
+    .value { @apply text-2xl font-semibold text-gray-900; }
+    .grid-fit { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+    .chip { @apply inline-flex items-center rounded-full px-3 py-1 text-sm font-medium; }
+  </style>
+</head>
+<body class="bg-gray-50">
+<div id="app" class="max-w-7xl mx-auto p-6"></div>
+
+<script type="text/babel">
+
+const AREAS = ["manitoba","new-york","ontario","quebec_p33c","manitoba_sk"];
+const API_URL = "http://localhost:8000/api/simulation_data.json";
+
+function usePolling(url, intervalMs=5000) {
+  const [data, setData] = React.useState(null);
+  const [err, setErr] = React.useState(null);
+  React.useEffect(() => {
+    let alive = true;
+    async function tick() {
+      try {
+        const res = await fetch(url, { cache: "no-store" });
+        if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+        const j = await res.json();
+        if (alive) { setData(j); setErr(null); }
+      } catch(e) { if (alive) setErr(String(e)); }
+    }
+    tick();
+    const id = setInterval(tick, intervalMs);
+    return () => { alive = false; clearInterval(id); };
+  }, [url, intervalMs]);
+  return { data, err };
+}
+
+function StatCard({title, value, subtitle, accent="gray"}) {
+  const color = {
+    green: "text-green-600",
+    red: "text-red-600",
+    gray: "text-gray-900",
+    blue: "text-blue-600"
+  }[accent] || "text-gray-900";
+  return (
+    <div className="card">
+      <div className="title">{title}</div>
+      <div className={`value ${color}`}>{value}</div>
+      {subtitle && <div className="text-sm text-gray-500 mt-1">{subtitle}</div>}
+    </div>
+  );
+}
+
+function AreaCard({name, loadMW, priceF, priceA, socPct}) {
+  return (
+    <div className="card">
+      <div className="text-base font-semibold text-gray-900">{name}</div>
+      <div className="mt-2 grid grid-cols-2 gap-2 text-sm">
+        <div className="text-gray-500">Load</div><div className="text-gray-900 font-medium">{(loadMW ?? 0).toFixed(2)} MW</div>
+        <div className="text-gray-500">Price (F)</div><div className="text-gray-900 font-medium">${(priceF ?? 0).toFixed(2)} /MWh</div>
+        <div className="text-gray-500">Price (A)</div><div className="text-gray-900 font-medium">${(priceA ?? 0).toFixed(2)} /MWh</div>
+        <div className="text-gray-500">SOC</div><div className="text-gray-900 font-medium">{(socPct ?? 0).toFixed(1)}%</div>
+      </div>
+    </div>
+  );
+}
+
+function useLineChart(ref, labels, datasets) {
+  React.useEffect(() => {
+    if (!ref.current) return;
+    const ctx = ref.current.getContext("2d");
+    const chart = new Chart(ctx, {
+      type: "line",
+      data: { labels, datasets },
+      options: {
+        responsive: true,
+        animation: false,
+        plugins: { legend: { display: true } },
+        scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 10 } } }
+      }
+    });
+    return () => chart.destroy();
+  }, [ref, labels, datasets]);
+}
+
+function SectionTitle({children}) {
+  return <div className="mt-8 mb-3 text-sm font-semibold uppercase tracking-wide text-gray-500">{children}</div>;
+}
+
+function PriceTable({title, areas, pricesF, pricesA}) {
+  return (
+    <div className="card">
+      <div className="title">{title}</div>
+      <div className="mt-3 overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-gray-500 text-left">
+              <th className="py-2">Area</th>
+              <th className="py-2">Forecast $/MWh</th>
+              <th className="py-2">Actual $/MWh</th>
+            </tr>
+          </thead>
+          <tbody>
+            {areas.map(a => (
+              <tr key={a} className="border-t border-gray-100">
+                <td className="py-2 font-medium text-gray-900">{a}</td>
+                <td className="py-2">${(pricesF?.[a] ?? 0).toFixed(2)}</td>
+                <td className="py-2">${(pricesA?.[a] ?? 0).toFixed(2)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const { data, err } = usePolling(API_URL, 5000);
+
+  if (err) return <div className="p-6 text-red-600">Error: {err}</div>;
+  if (!data || data.status === "starting") {
+    return (
+      <div className="p-6">
+        <h1 className="text-3xl font-bold">Data Center Optimization Dashboard</h1>
+        <div className="chip bg-amber-100 text-amber-800 mt-4">Waiting for first optimization step…</div>
+        <pre className="mt-6 text-xs bg-white p-4 rounded-xl shadow-soft">{JSON.stringify(data ?? {}, null, 2)}</pre>
+      </div>
+    );
+  }
+
+  const step = data.step ?? 0;
+  const running = data.status === "running";
+  const badgeClass = running ? "bg-emerald-100 text-emerald-800" : "bg-slate-200 text-slate-700";
+
+  const current = data.current || {};
+  const previous = data.previous || null;
+
+  const areaLoads = current.perAreaLoadMW || {};
+  const soc = data.soc || {};
+  const priceF = current.areaPriceForecast || {};
+  const priceA = current.areaPriceActual || {};
+
+  // Charts (history)
+  const labels = (data.hist?.steps || []).map((_, i) => i.toString());
+  const totalLoad = data.hist?.total_load || [];
+  const totalSavings = data.hist?.total_savings || [];
+
+  // Price chart per area (forecast)
+  const areaPriceHist = data.hist?.area_price || {};
+  const datasetsPrice = AREAS.map((a, idx) => ({
+    label: `Price ${a} (F)`,
+    data: areaPriceHist[a] || [],
+    borderWidth: 2,
+    fill: false,
+    tension: 0.3
+  }));
+
+  // Area load chart
+  const areaLoadHist = data.hist?.area_load || {};
+  const datasetsLoad = AREAS.map((a) => ({
+    label: `Load ${a} (MW)`,
+    data: areaLoadHist[a] || [],
+    borderWidth: 2,
+    fill: false,
+    tension: 0.3
+  }));
+
+  const loadRef = React.useRef(null);
+  const savingsRef = React.useRef(null);
+  const priceRef = React.useRef(null);
+  const areaLoadRef = React.useRef(null);
+
+  useLineChart(loadRef, labels, [{ label: "Total Load (MW)", data: totalLoad, borderWidth: 2, tension: 0.3 }]);
+  useLineChart(savingsRef, labels, [{ label: "Total Savings ($, forecast)", data: totalSavings, borderWidth: 2, tension: 0.3 }]);
+  useLineChart(priceRef, labels, datasetsPrice);
+  useLineChart(areaLoadRef, labels, datasetsLoad);
+
+  const dollars = n => (n ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
+
+  return (
+    <div>
+      <div className="flex items-center gap-3">
+        <h1 className="text-3xl font-bold">Data Center Optimization Dashboard</h1>
+        <span className={`chip ${badgeClass}`}>{running ? "Running" : data.status} — step {step+1} / 288</span>
+        <span className="chip bg-slate-100 text-slate-700">
+          {current?.time?.date} {current?.time?.hhmm}
+        </span>
+      </div>
+
+      <div className="mt-6 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <StatCard title="Total Load (MW)" value={(data.totalLoad ?? 0).toFixed(2)} />
+        <StatCard title="Cost (forecast cum.)" value={`$${dollars(data.totalCost)}`} />
+        <StatCard title="Savings (forecast cum.)" value={`$${dollars(data.totalSavings)}`} accent="green" />
+        <StatCard title="Realized Savings (actual cum.)" value={`$${dollars(data.realizedSavings)}`} accent="blue" />
+      </div>
+
+      <SectionTitle>Per-area (current step)</SectionTitle>
+      <div className="grid grid-fit gap-4">
+        {AREAS.map(a => (
+          <AreaCard
+            key={a}
+            name={a}
+            loadMW={areaLoads[a]}
+            priceF={priceF[a]}
+            priceA={priceA[a]}
+            socPct={soc[a]}
+          />
+        ))}
+      </div>
+
+      <SectionTitle>Current vs Previous Step (prices & costs)</SectionTitle>
+      <div className="grid md:grid-cols-2 gap-4">
+        <PriceTable title="Current step prices" areas={AREAS} pricesF={priceF} pricesA={priceA} />
+        <div className="card">
+          <div className="title">Current step costs</div>
+          <div className="mt-3 grid grid-cols-2 gap-2 text-sm">
+            <div className="text-gray-500">Forecast (opt)</div><div className="font-medium">${dollars(current?.stepCosts?.forecast_opt)}</div>
+            <div className="text-gray-500">Forecast (equal)</div><div className="font-medium">${dollars(current?.stepCosts?.forecast_equal)}</div>
+            <div className="text-gray-500">Forecast savings</div><div className="font-medium text-emerald-600">${dollars(current?.stepCosts?.forecast_savings)}</div>
+            <div className="text-gray-500">Realized (opt)</div><div className="font-medium">${dollars(current?.stepCosts?.realized_opt)}</div>
+            <div className="text-gray-500">Realized (equal)</div><div className="font-medium">${dollars(current?.stepCosts?.realized_equal)}</div>
+            <div className="text-gray-500">Realized savings</div><div className="font-medium text-blue-600">${dollars(current?.stepCosts?.realized_savings)}</div>
+            <div className="text-gray-500">Degradation (included)</div><div className="font-medium">${dollars(current?.stepCosts?.degradation)}</div>
+          </div>
+        </div>
+
+        {previous && (
+          <>
+            <PriceTable title="Previous step prices" areas={AREAS} pricesF={previous.areaPriceForecast} pricesA={previous.areaPriceActual} />
+            <div className="card">
+              <div className="title">Previous step costs</div>
+              <div className="mt-3 grid grid-cols-2 gap-2 text-sm">
+                <div className="text-gray-500">Forecast (opt)</div><div className="font-medium">${dollars(previous?.stepCosts?.forecast_opt)}</div>
+                <div className="text-gray-500">Forecast (equal)</div><div className="font-medium">${dollars(previous?.stepCosts?.forecast_equal)}</div>
+                <div className="text-gray-500">Forecast savings</div><div className="font-medium text-emerald-600">${dollars(previous?.stepCosts?.forecast_savings)}</div>
+                <div className="text-gray-500">Realized (opt)</div><div className="font-medium">${dollars(previous?.stepCosts?.realized_opt)}</div>
+                <div className="text-gray-500">Realized (equal)</div><div className="font-medium">${dollars(previous?.stepCosts?.realized_equal)}</div>
+                <div className="text-gray-500">Realized savings</div><div className="font-medium text-blue-600">${dollars(previous?.stepCosts?.realized_savings)}</div>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+
+      <SectionTitle>Live charts (~5h window)</SectionTitle>
+      <div className="grid md:grid-cols-2 gap-4">
+        <div className="card"><canvas ref={loadRef} height="110"></canvas></div>
+        <div className="card"><canvas ref={savingsRef} height="110"></canvas></div>
+        <div className="card md:col-span-2"><canvas ref={priceRef} height="110"></canvas></div>
+        <div className="card md:col-span-2"><canvas ref={areaLoadRef} height="110"></canvas></div>
+      </div>
+
+      <SectionTitle>Battery & Power Balance (current)</SectionTitle>
+      <div className="grid md:grid-cols-2 gap-4">
+        <div className="card">
+          <div className="title">Battery (net kW)</div>
+          <div className="value">{Math.round(current?.battery?.net_kw ?? 0)}</div>
+          <div className="text-sm text-gray-500 mt-1">
+            chg {Math.round(current?.battery?.charge_kw ?? 0)} / dis {Math.round(current?.battery?.discharge_kw ?? 0)}
+          </div>
+        </div>
+        <div className="card">
+          <div className="title">Power balance (kW)</div>
+          <div className="mt-2 text-sm">
+            Imports: <span className="font-medium">{Math.round(current?.power_balance?.imports_kw ?? 0)}</span><br/>
+            Battery net: <span className="font-medium">{Math.round(current?.power_balance?.battery_net_kw ?? 0)}</span><br/>
+            Load: <span className="font-medium">{Math.round(current?.power_balance?.load_kw ?? 0)}</span><br/>
+            Residual: <span className="font-semibold">{Math.round(current?.power_balance?.residual_kw ?? 0)}</span>
+          </div>
+        </div>
+      </div>
+
+      <SectionTitle>Debug payload</SectionTitle>
+      <pre className="text-xs bg-white p-4 rounded-2xl shadow-soft overflow-auto">{JSON.stringify(data, null, 2)}</pre>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("app")).render(<App/>);
+</script>
+</body>
+</html>
