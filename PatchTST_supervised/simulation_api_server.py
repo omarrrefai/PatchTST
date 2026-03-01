@@ -78,6 +78,8 @@ DEG_COST_PER_KWH = 0.003
 SOC_MIN_FRAC  = 0.10
 E_MIN = SOC_MIN_FRAC * BATTERY_KWH
 E_MAX = BATTERY_KWH
+SOC_TARGET_KWH = BATTERY_KWH * 0.50
+SOC_TRACK_PENALTY_PER_KWH = 0.002
 
 # Grid limits/fees
 PIMP_MAX_KW = {a: 20000.0 for a in AREAS}
@@ -606,6 +608,12 @@ def run_mpc_step(tpos: int) -> dict:
         model += soc[(a,H)] >= max(E_MIN, E0 - down)
         model += soc[(a,H)] <= min(E_MAX, E0 + up)
 
+    # terminal SoC target soft tracking (avoid permanently staying at minimum)
+    soc_dev_pos = {a: pl.LpVariable(f"socdev_pos_{a}", lowBound=0) for a in AREAS}
+    soc_dev_neg = {a: pl.LpVariable(f"socdev_neg_{a}", lowBound=0) for a in AREAS}
+    for a in AREAS:
+        model += soc[(a,H)] - SOC_TARGET_KWH == soc_dev_pos[a] - soc_dev_neg[a]
+
     # objective
     price_stack = {a: _price_for_horizon(a, tpos, mode)[0] for a in AREAS}
     terms = []
@@ -619,6 +627,7 @@ def run_mpc_step(tpos: int) -> dict:
             terms.append(-(p_exp[h] * (dt * SELL_PRICE_PER_MWH / 1000.0)))
     for a in AREAS:
         terms.append(HYSTERESIS_PENALTY * (v_pos[a] + v_neg[a]))
+        terms.append(SOC_TRACK_PENALTY_PER_KWH * (soc_dev_pos[a] + soc_dev_neg[a]))
     model += pl.lpSum(terms)
 
     model.solve(pl.PULP_CBC_CMD(msg=0))
@@ -874,6 +883,35 @@ def get_live():
         "previous": state["history"][-2] if len(state["history"]) >= 2 else None,
     }
     return JSONResponse(_json_safe(payload))
+
+
+
+
+@app.get("/api/log_status")
+def log_status():
+    return JSONResponse({
+        "logFile": str(LOG_FILE),
+        "exists": LOG_FILE.exists(),
+        "sizeBytes": int(LOG_FILE.stat().st_size) if LOG_FILE.exists() else 0,
+    })
+
+@app.get("/api/mode")
+def get_mode():
+    return JSONResponse({
+        "modeSelection": state.get("mode_selection", "auto"),
+        "activeMode": state.get("active_mode", "short"),
+        "availableModes": ["auto", "short", "medium", "long"],
+        "modeConfig": MODE_CONFIG,
+    })
+
+
+@app.post("/api/mode/{mode}")
+def set_mode(mode: str):
+    mode = mode.lower().strip()
+    if mode not in {"auto", "short", "medium", "long"}:
+        return JSONResponse({"status": "error", "message": f"Invalid mode '{mode}'"}, status_code=400)
+    state["mode_selection"] = mode
+    return JSONResponse({"status": "ok", "modeSelection": mode})
 
 
 
