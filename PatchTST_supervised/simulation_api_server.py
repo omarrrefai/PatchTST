@@ -155,6 +155,14 @@ SOURCE_TO_WINDOW = {
     "?": "unknown",
 }
 
+SOURCE_TO_WINDOW = {
+    "RT": "5m (t+1)",
+    "ST": "60m (12x5m)",
+    "DA": "24h (288x5m)",
+    "FWD": "carry-forward",
+    "?": "unknown",
+}
+
 # ----------------------------
 # Utilities (loading & mapping)
 # ----------------------------
@@ -445,7 +453,7 @@ def _price_for_horizon(a: str, tpos: int, mode: str) -> tuple[np.ndarray, str]:
                 tag_used = tg
                 break
 
-        # fallback: forward-fill then actual
+        # Fallback policy: forward-fill prior forecast, else use actual to keep MPC alive.
         if not np.isfinite(cand):
             if h > 0 and np.isfinite(out[h - 1]):
                 cand = out[h - 1]
@@ -689,8 +697,6 @@ def run_mpc_step(tpos: int) -> dict:
         },
         "forecastSource": step_forecast_src,
         "predictionWindow": prediction_window,
-        "optimizationMode": mode,
-        "horizonSteps": H,
         "stepCosts": {
             "forecast_opt": step_cost_forecast,
             "forecast_equal": step_cost_equal_forecast,
@@ -813,7 +819,6 @@ def get_live():
             "area_load": {a: state["history_area_load"][a][-W:] for a in AREAS},
             "area_price": {a: state["history_area_price"][a][-W:] for a in AREAS},
             "prediction_source": {a: state["history_prediction_source"][a][-W:] for a in AREAS},
-            "mode": state["history_mode"][-W:],
         },
         "current": {
             "perAreaLoadMW": last["area_load"],
@@ -833,7 +838,6 @@ def get_live():
             "time": time_obj,
             "forecastSource": price_src,
             "predictionWindow": prediction_window,
-            "optimizationMode": state.get("active_mode", "short"),
         },
         "previous": state["history"][-2] if len(state["history"]) >= 2 else None,
     }
@@ -872,57 +876,42 @@ def set_mode(mode: str):
 # Simulation loop (forever; 5s = 5min)
 # ----------------------------
 def simulate_loop():
-    while True:
-        try:
-            idx, actual, rt, st, da, total_load = _align_series_to_timeline()
-            state["timeline"]     = idx
-            state["actual"]       = actual
-            state["rt"]           = rt
-            state["st12"]         = st
-            state["da288"]        = da
-            state["total_load"]   = total_load
-            state["status"] = "running"
-            state["message"] = ""
+    try:
+        idx, actual, rt, st, da, total_load = _align_series_to_timeline()
+        state["timeline"]     = idx
+        state["actual"]       = actual
+        state["rt"]           = rt
+        state["st12"]         = st
+        state["da288"]        = da
+        state["total_load"]   = total_load
+        state["status"] = "running"
+        state["message"] = ""
 
-            while True:
-                t = state["idx"]
-                try:
-                    res = run_mpc_step(t)
-                except Exception as step_err:
-                    state["status"] = "running"
-                    state["message"] = f"step_error@{t}: {type(step_err).__name__}: {step_err}"
-                    time.sleep(1)
-                    state["idx"] = (t + 1) % len(state["timeline"])
-                    continue
+        while True:
+            t = state["idx"]
 
-                state["history"].append(res)
+            res = run_mpc_step(t)
+            state["history"].append(res)
 
-                # accumulate costs
-                state["opt_cost_forecast"]   += res["step_cost_forecast"]
-                state["equal_cost_forecast"] += res["step_cost_equal_forecast"]
-                state["opt_cost_actual"]     += res["step_cost_actual"]
-                state["equal_cost_actual"]   += res["step_cost_equal_actual"]
+            # accumulate costs
+            state["opt_cost_forecast"]   += res["step_cost_forecast"]
+            state["equal_cost_forecast"] += res["step_cost_equal_forecast"]
+            state["opt_cost_actual"]     += res["step_cost_actual"]
+            state["equal_cost_actual"]   += res["step_cost_equal_actual"]
 
-                # history tails for charts
-                state["history_steps"].append(t)
-                state["history_total_load"].append(float(state["total_load"][t]))
-                state["history_total_cost_forecast"].append(float(state["opt_cost_forecast"]))
-                state["history_total_savings_forecast"].append(float(state["equal_cost_forecast"] - state["opt_cost_forecast"]))
-                state["history_total_cost_actual"].append(float(state["opt_cost_actual"]))
-                state["history_total_savings_actual"].append(float(state["equal_cost_actual"] - state["opt_cost_actual"]))
-                state["history_mode"].append(state.get("active_mode", "short"))
-                for a in AREAS:
-                    state["history_soc"][a].append(float(state["soc"][a]) / E_MAX * 100.0)
-                    state["history_area_load"][a].append(float(res["area_load"][a]))
-                    state["history_area_price"][a].append(float(state["last_forecast_price"][a]))
-                    state["history_prediction_source"][a].append(state["last_forecast_src"][a])
-
-                # persist machine-consumable step record for offline analysis
-                _append_step_log(t, res)
-
-                # advance 1 step; loop forever
-                state["idx"] = (t + 1) % len(state["timeline"])
-                time.sleep(5)
+            # history tails for charts
+            state["history_steps"].append(t)
+            state["history_total_load"].append(float(state["total_load"][t]))
+            state["history_total_cost_forecast"].append(float(state["opt_cost_forecast"]))
+            state["history_total_savings_forecast"].append(float(state["equal_cost_forecast"] - state["opt_cost_forecast"]))
+            state["history_total_cost_actual"].append(float(state["opt_cost_actual"]))
+            state["history_total_savings_actual"].append(float(state["equal_cost_actual"] - state["opt_cost_actual"]))
+            for a in AREAS:
+                state["history_soc"][a].append(float(state["soc"][a]) / E_MAX * 100.0)
+                state["history_area_load"][a].append(float(res["area_load"][a]))
+                # record the forecast price used at this step (h=0)
+                state["history_area_price"][a].append(float(state["last_forecast_price"][a]))
+                state["history_prediction_source"][a].append(state["last_forecast_src"][a])
 
         except Exception as e:
             state["status"] = "error"
