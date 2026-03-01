@@ -34,7 +34,7 @@ function StatCard({ title, value, subtitle }) {
   );
 }
 
-function AreaCard({name, loadMW, priceF, priceA, socPct}) {
+function AreaCard({name, loadMW, priceF, priceA, socPct, src, windowLabel}) {
   return (
     <div className="card">
       <h4 style={{margin:0}}>{name}</h4>
@@ -42,6 +42,7 @@ function AreaCard({name, loadMW, priceF, priceA, socPct}) {
         <div className="subtle">Load</div><div className="subtle" style={{textAlign:"right"}}>{(loadMW ?? 0).toFixed(2)} MW</div>
         <div className="subtle">Price (F)</div><div className="subtle" style={{textAlign:"right"}}>${(priceF ?? 0).toFixed(2)}/MWh</div>
         <div className="subtle">Price (A)</div><div className="subtle" style={{textAlign:"right"}}>${(priceA ?? 0).toFixed(2)}/MWh</div>
+        <div className="subtle">Prediction</div><div className="subtle" style={{textAlign:"right"}}>{src ?? "?"} · {windowLabel ?? "unknown"}</div>
         <div className="subtle">SOC</div><div className="subtle" style={{textAlign:"right"}}>{(socPct ?? 0).toFixed(1)}%</div>
       </div>
     </div>
@@ -87,13 +88,15 @@ export default function App() {
   const soc = data.soc || {};
   const priceF = current.areaPriceForecast || {};
   const priceA = current.areaPriceActual || {};
+  const forecastSource = current.forecastSource || {};
+  const predictionWindow = current.predictionWindow || {};
   const dollars = n => (n ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
 
   // charts
   const steps = data.hist?.steps || [];
   const labels = steps.map((s,i)=> i.toString());
   const totalLoad = data.hist?.total_load || [];
-  const totalSavings = data.hist?.total_savings || [];
+  const totalSavings = data.hist?.total_savings_forecast || [];
   const priceHist = data.hist?.area_price || {};
   const areaLoadHist = data.hist?.area_load || {};
 
@@ -119,7 +122,7 @@ export default function App() {
 
       <h3 style={{marginTop:24}}>Per-area (current step)</h3>
       <div className="grid" style={{gridTemplateColumns:"repeat(auto-fit, minmax(230px, 1fr))"}}>
-        {AREAS.map(a => <AreaCard key={a} name={a} loadMW={areaLoads[a]} priceF={priceF[a]} priceA={priceA[a]} socPct={soc[a]} />)}
+        {AREAS.map(a => <AreaCard key={a} name={a} loadMW={areaLoads[a]} priceF={priceF[a]} priceA={priceA[a]} socPct={soc[a]} src={forecastSource[a]} windowLabel={predictionWindow[a]} />)}
       </div>
 
       <h3 style={{marginTop:24}}>Current vs Previous Step</h3>
@@ -128,13 +131,15 @@ export default function App() {
           <div className="title">Current step prices</div>
           <div style={{marginTop:10, overflowX:"auto"}}>
             <table className="table">
-              <thead><tr><th>Area</th><th>Forecast $/MWh</th><th>Actual $/MWh</th></tr></thead>
+              <thead><tr><th>Area</th><th>Forecast $/MWh</th><th>Actual $/MWh</th><th>Source</th><th>Window</th></tr></thead>
               <tbody>
                 {AREAS.map(a => (
                   <tr key={a}>
                     <td style={{fontWeight:600}}>{a}</td>
                     <td>${(priceF?.[a] ?? 0).toFixed(2)}</td>
                     <td>${(priceA?.[a] ?? 0).toFixed(2)}</td>
+                    <td>{current?.forecastSource?.[a] ?? "?"}</td>
+                    <td>{current?.predictionWindow?.[a] ?? "unknown"}</td>
                   </tr>
                 ))}
               </tbody>
@@ -161,13 +166,15 @@ export default function App() {
               <div className="title">Previous step prices</div>
               <div style={{marginTop:10, overflowX:"auto"}}>
                 <table className="table">
-                  <thead><tr><th>Area</th><th>Forecast $/MWh</th><th>Actual $/MWh</th></tr></thead>
+                  <thead><tr><th>Area</th><th>Forecast $/MWh</th><th>Actual $/MWh</th><th>Source</th><th>Window</th></tr></thead>
                   <tbody>
                     {AREAS.map(a => (
                       <tr key={a}>
                         <td style={{fontWeight:600}}>{a}</td>
                         <td>${(previous.areaPriceForecast?.[a] ?? 0).toFixed(2)}</td>
                         <td>${(previous.areaPriceActual?.[a] ?? 0).toFixed(2)}</td>
+                        <td>{previous.forecastSource?.[a] ?? "?"}</td>
+                        <td>{previous.predictionWindow?.[a] ?? "unknown"}</td>
                       </tr>
                     ))}
                   </tbody>
