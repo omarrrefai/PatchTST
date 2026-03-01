@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import threading, time
 import os
+import json
 from pathlib import Path
 from datetime import timedelta
 
@@ -82,6 +83,12 @@ USE_BINARIES_NO_SIM_CH_DIS = True
 
 # Optional de-normalization hook for predictions
 USE_DENO = True
+
+# Step logging (NDJSON) for later offline analysis/paper plots
+LOG_DIR = Path(os.getenv("PATCHTST_LOG_DIR", "logs/simulation"))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / "steps.ndjson"
+
 
 # ----------------------------
 # App & state
@@ -696,6 +703,40 @@ def run_mpc_step(tpos: int) -> dict:
     })
     return result
 
+
+def _append_step_log(t: int, res: dict) -> None:
+    ts = state["timeline"][t]
+    rec = {
+        "step": int(t),
+        "timestamp": ts.isoformat(),
+        "mode_selection": state.get("mode_selection", "auto"),
+        "active_mode": state.get("active_mode", "short"),
+        "total_load_mw": float(state["total_load"][t]),
+        "cost_forecast_cum": float(state["opt_cost_forecast"]),
+        "cost_equal_forecast_cum": float(state["equal_cost_forecast"]),
+        "cost_actual_cum": float(state["opt_cost_actual"]),
+        "cost_equal_actual_cum": float(state["equal_cost_actual"]),
+        "step_costs": {
+            "forecast_opt": float(res.get("step_cost_forecast", 0.0)),
+            "forecast_equal": float(res.get("step_cost_equal_forecast", 0.0)),
+            "actual_opt": float(res.get("step_cost_actual", 0.0)),
+            "actual_equal": float(res.get("step_cost_equal_actual", 0.0)),
+        },
+        "area_load_mw": {a: float(res.get("area_load", {}).get(a, 0.0)) for a in AREAS},
+        "area_price_forecast": {a: float(state.get("last_forecast_price", {}).get(a, np.nan)) for a in AREAS},
+        "area_price_actual": {a: float(state["actual"][a][t]) if np.isfinite(state["actual"][a][t]) else np.nan for a in AREAS},
+        "forecast_source": {a: state.get("last_forecast_src", {}).get(a, "?") for a in AREAS},
+        "prediction_window": {
+            a: SOURCE_TO_WINDOW.get(state.get("last_forecast_src", {}).get(a, "?"), "unknown")
+            for a in AREAS
+        },
+        "soc_percent": {a: float(state["soc"][a]) / E_MAX * 100.0 for a in AREAS},
+        "battery": res.get("battery", {}),
+        "power_balance": res.get("power_balance", {}),
+    }
+    with LOG_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
 # ----------------------------
 # API
 # ----------------------------
@@ -799,6 +840,16 @@ def get_live():
     return JSONResponse(payload)
 
 
+
+
+@app.get("/api/log_status")
+def log_status():
+    return JSONResponse({
+        "logFile": str(LOG_FILE),
+        "exists": LOG_FILE.exists(),
+        "sizeBytes": int(LOG_FILE.stat().st_size) if LOG_FILE.exists() else 0,
+    })
+
 @app.get("/api/mode")
 def get_mode():
     return JSONResponse({
@@ -821,51 +872,62 @@ def set_mode(mode: str):
 # Simulation loop (forever; 5s = 5min)
 # ----------------------------
 def simulate_loop():
-    try:
-        idx, actual, rt, st, da, total_load = _align_series_to_timeline()
-        state["timeline"]     = idx
-        state["actual"]       = actual
-        state["rt"]           = rt
-        state["st12"]         = st
-        state["da288"]        = da
-        state["total_load"]   = total_load
-        state["status"] = "running"
-        state["message"] = ""
+    while True:
+        try:
+            idx, actual, rt, st, da, total_load = _align_series_to_timeline()
+            state["timeline"]     = idx
+            state["actual"]       = actual
+            state["rt"]           = rt
+            state["st12"]         = st
+            state["da288"]        = da
+            state["total_load"]   = total_load
+            state["status"] = "running"
+            state["message"] = ""
 
-        while True:
-            t = state["idx"]
+            while True:
+                t = state["idx"]
+                try:
+                    res = run_mpc_step(t)
+                except Exception as step_err:
+                    state["status"] = "running"
+                    state["message"] = f"step_error@{t}: {type(step_err).__name__}: {step_err}"
+                    time.sleep(1)
+                    state["idx"] = (t + 1) % len(state["timeline"])
+                    continue
 
-            res = run_mpc_step(t)
-            state["history"].append(res)
+                state["history"].append(res)
 
-            # accumulate costs
-            state["opt_cost_forecast"]   += res["step_cost_forecast"]
-            state["equal_cost_forecast"] += res["step_cost_equal_forecast"]
-            state["opt_cost_actual"]     += res["step_cost_actual"]
-            state["equal_cost_actual"]   += res["step_cost_equal_actual"]
+                # accumulate costs
+                state["opt_cost_forecast"]   += res["step_cost_forecast"]
+                state["equal_cost_forecast"] += res["step_cost_equal_forecast"]
+                state["opt_cost_actual"]     += res["step_cost_actual"]
+                state["equal_cost_actual"]   += res["step_cost_equal_actual"]
 
-            # history tails for charts
-            state["history_steps"].append(t)
-            state["history_total_load"].append(float(state["total_load"][t]))
-            state["history_total_cost_forecast"].append(float(state["opt_cost_forecast"]))
-            state["history_total_savings_forecast"].append(float(state["equal_cost_forecast"] - state["opt_cost_forecast"]))
-            state["history_total_cost_actual"].append(float(state["opt_cost_actual"]))
-            state["history_total_savings_actual"].append(float(state["equal_cost_actual"] - state["opt_cost_actual"]))
-            state["history_mode"].append(state.get("active_mode", "short"))
-            for a in AREAS:
-                state["history_soc"][a].append(float(state["soc"][a]) / E_MAX * 100.0)
-                state["history_area_load"][a].append(float(res["area_load"][a]))
-                # record the forecast price used at this step (h=0)
-                state["history_area_price"][a].append(float(state["last_forecast_price"][a]))
-                state["history_prediction_source"][a].append(state["last_forecast_src"][a])
+                # history tails for charts
+                state["history_steps"].append(t)
+                state["history_total_load"].append(float(state["total_load"][t]))
+                state["history_total_cost_forecast"].append(float(state["opt_cost_forecast"]))
+                state["history_total_savings_forecast"].append(float(state["equal_cost_forecast"] - state["opt_cost_forecast"]))
+                state["history_total_cost_actual"].append(float(state["opt_cost_actual"]))
+                state["history_total_savings_actual"].append(float(state["equal_cost_actual"] - state["opt_cost_actual"]))
+                state["history_mode"].append(state.get("active_mode", "short"))
+                for a in AREAS:
+                    state["history_soc"][a].append(float(state["soc"][a]) / E_MAX * 100.0)
+                    state["history_area_load"][a].append(float(res["area_load"][a]))
+                    state["history_area_price"][a].append(float(state["last_forecast_price"][a]))
+                    state["history_prediction_source"][a].append(state["last_forecast_src"][a])
 
-            # advance 1 step; loop forever
-            state["idx"] = (t + 1) % len(state["timeline"])
+                # persist machine-consumable step record for offline analysis
+                _append_step_log(t, res)
+
+                # advance 1 step; loop forever
+                state["idx"] = (t + 1) % len(state["timeline"])
+                time.sleep(5)
+
+        except Exception as e:
+            state["status"] = "error"
+            state["message"] = f"{type(e).__name__}: {e}; retrying in 5s"
             time.sleep(5)
-
-    except Exception as e:
-        state["status"] = "error"
-        state["message"] = f"{type(e).__name__}: {e}"
 
 # ----------------------------
 # Main
