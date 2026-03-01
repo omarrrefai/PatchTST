@@ -113,9 +113,18 @@ state = {
     "history_total_savings_forecast": [],
     "history_total_cost_actual": [],
     "history_total_savings_actual": [],
+    "history_prediction_source": {a: [] for a in AREAS},
     "history_soc": {a: [] for a in AREAS},
     "history_area_load": {a: [] for a in AREAS},
     "history_area_price": {a: [] for a in AREAS},  # forecast used at each step
+}
+
+SOURCE_TO_WINDOW = {
+    "RT": "5m (t+1)",
+    "ST": "60m (12x5m)",
+    "DA": "24h (288x5m)",
+    "FWD": "carry-forward",
+    "?": "unknown",
 }
 
 # ----------------------------
@@ -542,6 +551,7 @@ def run_mpc_step(tpos: int) -> dict:
         step_forecast_src[a] = src0
     state["last_forecast_price"] = step_forecast_0
     state["last_forecast_src"]   = step_forecast_src
+    prediction_window = {a: SOURCE_TO_WINDOW.get(step_forecast_src[a], "unknown") for a in AREAS}
 
     # costs (step)
     dt_energy = DT_HOURS / 1000.0
@@ -575,6 +585,22 @@ def run_mpc_step(tpos: int) -> dict:
         "step_cost_equal_forecast": step_cost_equal_forecast,
         "step_cost_actual": step_cost_actual,
         "step_cost_equal_actual": step_cost_equal_actual,
+        "areaPriceForecast": step_forecast_0,
+        "areaPriceActual": {
+            a: float(state["actual"][a][tpos]) if np.isfinite(state["actual"][a][tpos]) else float(step_forecast_0[a])
+            for a in AREAS
+        },
+        "forecastSource": step_forecast_src,
+        "predictionWindow": prediction_window,
+        "stepCosts": {
+            "forecast_opt": step_cost_forecast,
+            "forecast_equal": step_cost_equal_forecast,
+            "forecast_savings": step_cost_equal_forecast - step_cost_forecast,
+            "realized_opt": step_cost_actual,
+            "realized_equal": step_cost_equal_actual,
+            "realized_savings": step_cost_equal_actual - step_cost_actual,
+            "degradation": deg_cost,
+        },
     })
     return result
 
@@ -614,6 +640,7 @@ def get_live():
     price_forecast = {a: float(state.get("last_forecast_price", {}).get(a, np.nan)) for a in AREAS}
     price_actual   = {a: float(state["actual"][a][t]) if a in state["actual"] and t < len(state["actual"][a]) and np.isfinite(state["actual"][a][t]) else np.nan for a in AREAS}
     price_src      = {a: state.get("last_forecast_src", {}).get(a, "?") for a in AREAS}
+    prediction_window = {a: SOURCE_TO_WINDOW.get(price_src[a], "unknown") for a in AREAS}
 
     W = 60
     payload = {
@@ -630,6 +657,7 @@ def get_live():
         "areaPriceForecast": price_forecast,
         "areaPriceActual":   price_actual,
         "forecastSource":    price_src,
+        "predictionWindow":  prediction_window,
         "soc": {a: float(state["soc"][a]) / E_MAX * 100.0 for a in AREAS},
         "battery": last.get("battery", {"charge_kw":0,"discharge_kw":0,"net_kw":0}),
         "power_balance": last.get("power_balance", {}),
@@ -643,6 +671,7 @@ def get_live():
             "soc": {a: state["history_soc"][a][-W:] for a in AREAS},
             "area_load": {a: state["history_area_load"][a][-W:] for a in AREAS},
             "area_price": {a: state["history_area_price"][a][-W:] for a in AREAS},
+            "prediction_source": {a: state["history_prediction_source"][a][-W:] for a in AREAS},
         },
         "current": {
             "perAreaLoadMW": last["area_load"],
@@ -660,6 +689,8 @@ def get_live():
             "battery": last.get("battery", {}),
             "power_balance": last.get("power_balance", {}),
             "time": time_obj,
+            "forecastSource": price_src,
+            "predictionWindow": prediction_window,
         },
         "previous": state["history"][-2] if len(state["history"]) >= 2 else None,
     }
@@ -704,6 +735,7 @@ def simulate_loop():
                 state["history_area_load"][a].append(float(res["area_load"][a]))
                 # record the forecast price used at this step (h=0)
                 state["history_area_price"][a].append(float(state["last_forecast_price"][a]))
+                state["history_prediction_source"][a].append(state["last_forecast_src"][a])
 
             # advance 1 step; loop forever
             state["idx"] = (t + 1) % len(state["timeline"])
