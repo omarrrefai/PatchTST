@@ -31,9 +31,19 @@ _DATA_ROOT_CANDIDATES = [
 DATA_ROOT = next((Path(p) for p in _DATA_ROOT_CANDIDATES if p and Path(p).exists()), Path(_DATA_ROOT_CANDIDATES[1]))
 RESULTS_ROOT = Path("results")
 
-DA_GLOB  = "PTST_CAN_features_DA288_{area}_PatchTST_custom_ftM_sl576_ll72_pl288_*"
-ST_GLOB  = "PTST_CAN_features_ST12_{area}_PatchTST_custom_ftM_sl576_ll72_pl12_*"   # optional
-RT_GLOB  = "PTST_CAN_features_t+1_{area}_PatchTST_custom_ftM_sl576_ll72_pl1_*"
+DA_GLOBS = [
+    "PTST_CAN_features_DA288_{area}_*",
+    "*DA288*{area}*",
+]
+ST_GLOBS = [
+    "PTST_CAN_features_ST12_{area}_*",
+    "*ST12*{area}*",
+]
+RT_GLOBS = [
+    "PTST_CAN_features_t+1_{area}_*",
+    "*t+1*{area}*",
+    "*pl1*{area}*",
+]
 
 PRICE_CH_IDX = -1  # if pred has channels, pick this for price
 
@@ -83,6 +93,13 @@ USE_BINARIES_NO_SIM_CH_DIS = True
 
 # Optional de-normalization hook for predictions
 USE_DENO = True
+ALLOW_ACT_FALLBACK = os.getenv("PATCHTST_ALLOW_ACT_FALLBACK", "0") == "1"
+
+# Step logging (NDJSON) for later offline analysis/paper plots
+LOG_DIR = Path(os.getenv("PATCHTST_LOG_DIR", "logs/simulation"))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / "steps.ndjson"
+
 
 # Step logging (NDJSON) for later offline analysis/paper plots
 LOG_DIR = Path(os.getenv("PATCHTST_LOG_DIR", "logs/simulation"))
@@ -158,14 +175,14 @@ SOURCE_TO_WINDOW = {
 # ----------------------------
 # Utilities (loading & mapping)
 # ----------------------------
-def _latest_result_dir(glob_pat: str) -> Path | None:
-    cands = sorted(
-        (p for p in RESULTS_ROOT.glob(glob_pat) if (p / "pred.npy").exists()),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True
-    )
-    # Return the NEWEST, not the oldest
-    return cands[0] if cands else None
+def _latest_result_dir(glob_pats: list[str]) -> Path | None:
+    all_cands = []
+    for gp in glob_pats:
+        all_cands.extend([p for p in RESULTS_ROOT.glob(gp) if (p / "pred.npy").exists()])
+    if not all_cands:
+        return None
+    cands = sorted({p.resolve(): p for p in all_cands}.values(), key=lambda p: p.stat().st_mtime, reverse=True)
+    return cands[0]
 
 
 def _load_actual_series(area: str) -> pd.Series:
@@ -180,7 +197,7 @@ def _load_actual_series(area: str) -> pd.Series:
     return s
 
 def _load_st_matrix(area: str) -> tuple[np.ndarray, pd.DatetimeIndex] | None:
-    resdir = _latest_result_dir(ST_GLOB.format(area=area))
+    resdir = _latest_result_dir([g.format(area=area) for g in ST_GLOBS])
     if resdir is None:
         return None
     pred = np.asarray(np.load(resdir / "pred.npy"))
@@ -215,7 +232,7 @@ def _load_st_matrix(area: str) -> tuple[np.ndarray, pd.DatetimeIndex] | None:
     return mat2, anchors
 
 def _load_rt_vector(area: str) -> np.ndarray:
-    resdir = _latest_result_dir(RT_GLOB.format(area=area))
+    resdir = _latest_result_dir([g.format(area=area) for g in RT_GLOBS])
     if resdir is None:
         raise FileNotFoundError(f"RT results not found for {area}")
     arr = np.asarray(np.load(resdir / "pred.npy"))
@@ -451,12 +468,18 @@ def _price_for_horizon(a: str, tpos: int, mode: str) -> tuple[np.ndarray, str]:
                 cand = out[h - 1]
                 tag_used = "FWD"
             else:
-                v_act = state["actual"][a][i] if 0 <= i < len(state["actual"][a]) else np.nan
-                if np.isfinite(v_act):
-                    cand = float(v_act)
-                    tag_used = "ACT"
+                # prefer persistence from last published forecast over peeking at actual
+                v_prev = state.get("last_forecast_price", {}).get(a, np.nan)
+                if np.isfinite(v_prev):
+                    cand = float(v_prev)
+                    tag_used = "FWD"
                 else:
-                    raise RuntimeError(f"No forecast available for {a} at index {i} (h={h})")
+                    v_act = state["actual"][a][i] if 0 <= i < len(state["actual"][a]) else np.nan
+                    if ALLOW_ACT_FALLBACK and np.isfinite(v_act):
+                        cand = float(v_act)
+                        tag_used = "ACT"
+                    else:
+                        raise RuntimeError(f"No forecast available for {a} at index {i} (h={h})")
 
         out[h] = cand
         if h == 0:
@@ -482,7 +505,7 @@ def _maybe_denorm(area: str, arr: np.ndarray, resdir: Path) -> np.ndarray:
     return arr
 
 def _load_da_matrix(area: str) -> tuple[np.ndarray, pd.DatetimeIndex]:
-    resdir = _latest_result_dir(DA_GLOB.format(area=area))
+    resdir = _latest_result_dir([g.format(area=area) for g in DA_GLOBS])
     if resdir is None:
         raise FileNotFoundError(f"DA results not found for {area}")
 
@@ -755,6 +778,15 @@ def health():
             "rt_has": {a: bool(np.isfinite(state["rt"].get(a, np.array([]))).any()) for a in AREAS},
             "st_has": {a: bool(np.isfinite(state["st12"].get(a, np.array([]))).any()) for a in AREAS},
             "da_has": {a: bool(np.isfinite(state["da288"].get(a, np.array([]))).any()) for a in AREAS},
+            "act_fallback_enabled": ALLOW_ACT_FALLBACK,
+            "forecast_non_nan": {
+                a: {
+                    "rt": int(np.isfinite(state["rt"].get(a, np.array([]))).sum()),
+                    "st": int(np.isfinite(state["st12"].get(a, np.array([]))).sum()),
+                    "da": int(np.isfinite(state["da288"].get(a, np.array([]))).sum()),
+                }
+                for a in AREAS
+            },
         })
     except Exception as e:
         return JSONResponse({"status":"error","message":f"{type(e).__name__}: {e}"})
