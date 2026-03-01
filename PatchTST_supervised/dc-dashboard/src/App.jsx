@@ -2,8 +2,8 @@ import React from "react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from "recharts";
 
 const AREAS = ["manitoba", "new-york", "ontario", "quebec_p33c", "manitoba_sk"];
-const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000/api/simulation_data.json";
-const API_BASE = import.meta.env.VITE_API_BASE ?? API_URL.replace(/\/simulation_data\.json$/, "");
+const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000/api";
+const API_URL = `${API_BASE}/simulation_data.json`;
 
 function usePolling(url, intervalMs = 5000) {
   const [data, setData] = React.useState(null);
@@ -31,16 +31,16 @@ function StatCard({ title, value, subtitle }) {
   return <div className="card"><div className="title">{title}</div><div className="value">{value}</div>{subtitle && <div className="subtle">{subtitle}</div>}</div>;
 }
 
-function AreaCard({ name, loadMW, priceF, priceA, socPct, src, windowLabel }) {
+function AreaCard({name, loadMW, priceF, priceA, socPct, src, windowLabel}) {
   return (
     <div className="card">
-      <h4 style={{ margin: 0 }}>{name}</h4>
-      <div className="grid" style={{ gridTemplateColumns: "1fr 1fr", marginTop: 8 }}>
-        <div className="subtle">Load</div><div className="subtle" style={{ textAlign: "right" }}>{(loadMW ?? 0).toFixed(2)} MW</div>
-        <div className="subtle">Price (F)</div><div className="subtle" style={{ textAlign: "right" }}>${(priceF ?? 0).toFixed(2)}/MWh</div>
-        <div className="subtle">Price (A)</div><div className="subtle" style={{ textAlign: "right" }}>${(priceA ?? 0).toFixed(2)}/MWh</div>
-        <div className="subtle">Prediction</div><div className="subtle" style={{ textAlign: "right" }}>{src ?? "?"} · {windowLabel ?? "unknown"}</div>
-        <div className="subtle">SOC</div><div className="subtle" style={{ textAlign: "right" }}>{(socPct ?? 0).toFixed(1)}%</div>
+      <h4 style={{margin:0}}>{name}</h4>
+      <div className="grid" style={{gridTemplateColumns:"1fr 1fr", marginTop:8}}>
+        <div className="subtle">Load</div><div className="subtle" style={{textAlign:"right"}}>{(loadMW ?? 0).toFixed(2)} MW</div>
+        <div className="subtle">Price (F)</div><div className="subtle" style={{textAlign:"right"}}>${(priceF ?? 0).toFixed(2)}/MWh</div>
+        <div className="subtle">Price (A)</div><div className="subtle" style={{textAlign:"right"}}>${(priceA ?? 0).toFixed(2)}/MWh</div>
+        <div className="subtle">Prediction</div><div className="subtle" style={{textAlign:"right"}}>{src ?? "?"} · {windowLabel ?? "unknown"}</div>
+        <div className="subtle">SOC</div><div className="subtle" style={{textAlign:"right"}}>{(socPct ?? 0).toFixed(1)}%</div>
       </div>
     </div>
   );
@@ -92,13 +92,12 @@ export default function App() {
   const priceA = current.areaPriceActual || {};
   const forecastSource = current.forecastSource || {};
   const predictionWindow = current.predictionWindow || {};
-  const dollars = (n) => (n ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
+  const dollars = n => (n ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
 
   const steps = data.hist?.steps || [];
   const labels = steps.map((_, i) => i.toString());
   const totalLoad = data.hist?.total_load || [];
   const totalSavings = data.hist?.total_savings_forecast || [];
-  const modeHist = data.hist?.mode || [];
   const priceHist = data.hist?.area_price || {};
   const areaLoadHist = data.hist?.area_load || {};
 
@@ -123,14 +122,37 @@ export default function App() {
         <button className="badge" disabled={modeBusy} onClick={() => setMode("long")}>long</button>
       </div>
 
-      {page === "comparison" ? (
-        <>
-          <h3 style={{ marginTop: 24 }}>Cost Comparison</h3>
-          <div className="grid grid-4" style={{ marginTop: 16 }}>
-            <StatCard title="With Forecast (model basis)" value={`$${dollars(data.costComparison?.withForecast_forecastBasis)}`} />
-            <StatCard title="Without Forecast (equal split)" value={`$${dollars(data.costComparison?.withoutForecast_forecastBasis)}`} />
-            <StatCard title="With Forecast (actual basis)" value={`$${dollars(data.costComparison?.withForecast_actualBasis)}`} />
-            <StatCard title="Without Forecast (actual basis)" value={`$${dollars(data.costComparison?.withoutForecast_actualBasis)}`} />
+      <div className="grid grid-4" style={{marginTop:16}}>
+        <StatCard title="Total Load (MW)" value={(data.totalLoad ?? 0).toFixed(2)} />
+        <StatCard title="Cost (forecast cum.)" value={`$${dollars(data.totalCost)}`} />
+        <StatCard title="Savings (forecast cum.)" value={`$${dollars(data.totalSavings)}`} />
+        <StatCard title="Realized Savings (actual cum.)" value={`$${dollars(data.realizedSavings)}`} />
+      </div>
+
+      <h3 style={{marginTop:24}}>Per-area (current step)</h3>
+      <div className="grid" style={{gridTemplateColumns:"repeat(auto-fit, minmax(230px, 1fr))"}}>
+        {AREAS.map(a => <AreaCard key={a} name={a} loadMW={areaLoads[a]} priceF={priceF[a]} priceA={priceA[a]} socPct={soc[a]} src={forecastSource[a]} windowLabel={predictionWindow[a]} />)}
+      </div>
+
+      <h3 style={{marginTop:24}}>Current vs Previous Step</h3>
+      <div className="grid grid-2">
+        <div className="card">
+          <div className="title">Current step prices</div>
+          <div style={{marginTop:10, overflowX:"auto"}}>
+            <table className="table">
+              <thead><tr><th>Area</th><th>Forecast $/MWh</th><th>Actual $/MWh</th><th>Source</th><th>Window</th></tr></thead>
+              <tbody>
+                {AREAS.map(a => (
+                  <tr key={a}>
+                    <td style={{fontWeight:600}}>{a}</td>
+                    <td>${(priceF?.[a] ?? 0).toFixed(2)}</td>
+                    <td>${(priceA?.[a] ?? 0).toFixed(2)}</td>
+                    <td>{current?.forecastSource?.[a] ?? "?"}</td>
+                    <td>{current?.predictionWindow?.[a] ?? "unknown"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
           <div className="grid grid-2" style={{ marginTop: 20 }}>
             <LineBlock title="Savings (forecast $)" series={savingsSeries} />
@@ -145,6 +167,44 @@ export default function App() {
             <StatCard title="Savings (forecast cum.)" value={`$${dollars(data.totalSavings)}`} />
             <StatCard title="Realized Savings (actual cum.)" value={`$${dollars(data.realizedSavings)}`} />
           </div>
+        </div>
+
+        {previous && (
+          <>
+            <div className="card">
+              <div className="title">Previous step prices</div>
+              <div style={{marginTop:10, overflowX:"auto"}}>
+                <table className="table">
+                  <thead><tr><th>Area</th><th>Forecast $/MWh</th><th>Actual $/MWh</th><th>Source</th><th>Window</th></tr></thead>
+                  <tbody>
+                    {AREAS.map(a => (
+                      <tr key={a}>
+                        <td style={{fontWeight:600}}>{a}</td>
+                        <td>${(previous.areaPriceForecast?.[a] ?? 0).toFixed(2)}</td>
+                        <td>${(previous.areaPriceActual?.[a] ?? 0).toFixed(2)}</td>
+                        <td>{previous.forecastSource?.[a] ?? "?"}</td>
+                        <td>{previous.predictionWindow?.[a] ?? "unknown"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div className="card">
+              <div className="title">Previous step costs</div>
+              <div className="grid" style={{gridTemplateColumns:"1fr 1fr", marginTop:10}}>
+                <div className="subtle">Forecast (opt)</div><div className="subtle" style={{textAlign:"right"}}>${dollars(previous?.stepCosts?.forecast_opt)}</div>
+                <div className="subtle">Forecast (equal)</div><div className="subtle" style={{textAlign:"right"}}>${dollars(previous?.stepCosts?.forecast_equal)}</div>
+                <div className="subtle">Forecast savings</div><div className="subtle" style={{textAlign:"right"}}>${dollars(previous?.stepCosts?.forecast_savings)}</div>
+                <div className="subtle">Realized (opt)</div><div className="subtle" style={{textAlign:"right"}}>${dollars(previous?.stepCosts?.realized_opt)}</div>
+                <div className="subtle">Realized (equal)</div><div className="subtle" style={{textAlign:"right"}}>${dollars(previous?.stepCosts?.realized_equal)}</div>
+                <div className="subtle">Realized savings</div><div className="subtle" style={{textAlign:"right"}}>${dollars(previous?.stepCosts?.realized_savings)}</div>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
 
           <h3 style={{ marginTop: 24 }}>Per-area (current step)</h3>
           <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(230px, 1fr))" }}>
