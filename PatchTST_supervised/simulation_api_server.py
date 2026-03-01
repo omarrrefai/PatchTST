@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import threading, time
+import os
 from pathlib import Path
 from datetime import timedelta
 
@@ -21,7 +22,12 @@ import pulp as pl
 AREAS = ["manitoba", "new-york", "ontario", "quebec_p33c", "manitoba_sk"]
 
 # Files/paths
-DATA_ROOT = Path("/home/omaralrefai/dev/PatchTST/.dataset/canada/per_area_features_clean")
+_DATA_ROOT_CANDIDATES = [
+    os.getenv("PATCHTST_DATA_ROOT", "").strip(),
+    str(Path(__file__).resolve().parents[1] / ".dataset" / "canada" / "per_area_features_clean"),
+    "/home/omaralrefai/dev/PatchTST/.dataset/canada/per_area_features_clean",
+]
+DATA_ROOT = next((Path(p) for p in _DATA_ROOT_CANDIDATES if p and Path(p).exists()), Path(_DATA_ROOT_CANDIDATES[1]))
 RESULTS_ROOT = Path("results")
 
 DA_GLOB  = "PTST_CAN_features_DA288_{area}_PatchTST_custom_ftM_sl576_ll72_pl288_*"
@@ -39,10 +45,17 @@ N30  = 6
 
 # MPC horizon (in 5-min steps)
 MPC_H = 24   # 2 hours look-ahead
+MODE_CONFIG = {
+    "short": {"horizon": 12, "priority": ["RT", "ST", "DA"]},
+    "medium": {"horizon": 72, "priority": ["ST", "DA", "RT"]},
+    "long": {"horizon": 288, "priority": ["DA", "ST", "RT"]},
+}
+AUTO_MODE_PERIOD_STEPS = 24  # switch every 2 hours (24x5min)
 
 # Load composition
 NONSHIFTABLE_FRACTION = 0.35
 AREA_WEIGHTS = {a: 1.0 for a in AREAS}
+AREA_PHASE = {a: i * 0.85 for i, a in enumerate(AREAS)}
 
 # Battery (per site)
 BATTERY_KWH   = 4000.0
@@ -54,6 +67,8 @@ DEG_COST_PER_KWH = 0.003
 SOC_MIN_FRAC  = 0.10
 E_MIN = SOC_MIN_FRAC * BATTERY_KWH
 E_MAX = BATTERY_KWH
+SOC_TARGET_KWH = BATTERY_KWH * 0.50
+SOC_TRACK_PENALTY_PER_KWH = 0.002
 
 # Grid limits/fees
 PIMP_MAX_KW = {a: 20000.0 for a in AREAS}
@@ -113,9 +128,24 @@ state = {
     "history_total_savings_forecast": [],
     "history_total_cost_actual": [],
     "history_total_savings_actual": [],
+    "history_prediction_source": {a: [] for a in AREAS},
     "history_soc": {a: [] for a in AREAS},
     "history_area_load": {a: [] for a in AREAS},
     "history_area_price": {a: [] for a in AREAS},  # forecast used at each step
+    "history_mode": [],
+
+    # optimization method selection
+    "mode_selection": "auto",  # auto | short | medium | long
+    "active_mode": "short",
+}
+
+SOURCE_TO_WINDOW = {
+    "RT": "5m (t+1)",
+    "ST": "60m (12x5m)",
+    "DA": "24h (288x5m)",
+    "FWD": "carry-forward",
+    "ACT": "actual fallback",
+    "?": "unknown",
 }
 
 # ----------------------------
@@ -229,9 +259,43 @@ def _align_series_to_timeline():
                 ss = s.reindex(idx).interpolate(limit=6, limit_direction="both")
                 ss = ss.fillna(method="ffill").fillna(method="bfill")
                 actual[a] = ss.to_numpy(dtype=float)
+
+            # align available forecasts to same real timeline (do not leave all-NaN)
             rt = {a: np.full(len(idx), np.nan, float) for a in AREAS}
             st = {a: np.full(len(idx), np.nan, float) for a in AREAS}
             da = {a: np.full(len(idx), np.nan, float) for a in AREAS}
+
+            for a in AREAS:
+                try:
+                    vec = _load_rt_vector(a)
+                    take = min(len(vec), len(idx))
+                    if take > 0:
+                        rt[a][-take:] = vec[-take:].astype(float)
+                except Exception:
+                    pass
+
+            for a in AREAS:
+                try:
+                    mat, anchors = _load_da_matrix(a)
+                    for k, day0 in enumerate(anchors):
+                        pos = idx.get_indexer([pd.Timestamp(day0).normalize()])[0]
+                        if pos >= 0 and pos + 288 <= len(idx):
+                            da[a][pos:pos+288] = mat[k]
+                except Exception:
+                    pass
+
+            for a in AREAS:
+                try:
+                    st_loaded = _load_st_matrix(a)
+                    if st_loaded:
+                        mat, anchors = st_loaded
+                        for k, h0 in enumerate(anchors):
+                            pos = idx.get_indexer([pd.Timestamp(h0).floor("H")])[0]
+                            if pos >= 0 and pos + 12 <= len(idx):
+                                st[a][pos:pos+12] = mat[k]
+                except Exception:
+                    pass
+
             # synthetic load
             t = np.arange(len(idx))
             diurnal = 2.2 * np.sin(2*np.pi*(t % 288)/288 - np.pi/2)
@@ -311,55 +375,81 @@ def _align_series_to_timeline():
 
     return idx, actual, rt, st, da, total_load
 
-def _floor_per_area_kw(total_mw: float) -> dict:
-    base_kw = total_mw * 1000.0 * NONSHIFTABLE_FRACTION
-    wsum = sum(AREA_WEIGHTS.values())
-    return {a: base_kw * (AREA_WEIGHTS[a] / wsum) for a in AREAS}
+def _mode_for_step(tpos: int) -> str:
+    sel = state.get("mode_selection", "auto")
+    if sel in MODE_CONFIG:
+        return sel
+    bucket = (tpos // AUTO_MODE_PERIOD_STEPS) % 3
+    return ["short", "medium", "long"][bucket]
+
+
+def _per_area_load_target_kw(total_mw: float, tpos: int) -> dict:
+    """Area-varying target load profile so each DC has dynamic demand over time."""
+    total_kw = total_mw * 1000.0
+    raw = {}
+    for i, a in enumerate(AREAS):
+        base = AREA_WEIGHTS.get(a, 1.0)
+        # deterministic multi-frequency modulation per area
+        mod = 1.0 + 0.20 * np.sin(2 * np.pi * (tpos % 288) / 288 + AREA_PHASE[a])
+        mod += 0.10 * np.sin(2 * np.pi * (tpos % (288 * 7)) / (288 * 7) + 0.37 * i)
+        raw[a] = max(0.2, base * mod)
+    norm = sum(raw.values())
+    return {a: total_kw * raw[a] / norm for a in AREAS}
+
+
+def _floor_per_area_kw(total_mw: float, tpos: int) -> dict:
+    target_kw = _per_area_load_target_kw(total_mw, tpos)
+    return {a: NONSHIFTABLE_FRACTION * target_kw[a] for a in AREAS}
 
 # ----------------------------
 # Forecast stack (strict, no ACTUAL fallback)
 # ----------------------------
-def _price_for_horizon(a: str, tpos: int) -> tuple[np.ndarray, str]:
-    H = MPC_H
+def _price_for_horizon(a: str, tpos: int, mode: str) -> tuple[np.ndarray, str]:
+    H = MODE_CONFIG[mode]["horizon"]
     out = np.empty(H, dtype=float)
     out[:] = np.nan
     src0 = "?"
 
+    pri = MODE_CONFIG[mode]["priority"]
+
     for h in range(H):
         i = tpos + h
         cand = np.nan
-        tags, vals = [], []
-
-        if h == 0:
-            tags = ["RT", "ST", "DA"]
-            vals = [
-                state["rt"][a][i]  if 0 <= i < len(state["rt"][a]) else np.nan,
-                state["st12"][a][i] if 0 <= i < len(state["st12"][a]) else np.nan,
-                state["da288"][a][i] if 0 <= i < len(state["da288"][a]) else np.nan,
-            ]
-        elif h < 12:
-            tags = ["ST", "DA"]
-            vals = [
-                state["st12"][a][i] if 0 <= i < len(state["st12"][a]) else np.nan,
-                state["da288"][a][i] if 0 <= i < len(state["da288"][a]) else np.nan,
-            ]
-        else:
-            tags = ["DA"]
-            vals = [state["da288"][a][i] if 0 <= i < len(state["da288"][a]) else np.nan]
-
         tag_used = None
-        for v, tg in zip(vals, tags):
-            if np.isfinite(v):
-                cand = float(v); tag_used = tg; break
 
-        # STRICT fallback: carry forward **last valid forecast**, not 0.0
+        # keep horizon-aware behavior while allowing mode-specific source priority
+        allowed = set(pri)
+        if h >= 12 and "RT" in allowed:
+            allowed.remove("RT")
+        if h >= 288 and "ST" in allowed:
+            allowed.remove("ST")
+
+        for tg in pri:
+            if tg not in allowed:
+                continue
+            if tg == "RT":
+                v = state["rt"][a][i] if 0 <= i < len(state["rt"][a]) else np.nan
+            elif tg == "ST":
+                v = state["st12"][a][i] if 0 <= i < len(state["st12"][a]) else np.nan
+            else:
+                v = state["da288"][a][i] if 0 <= i < len(state["da288"][a]) else np.nan
+            if np.isfinite(v):
+                cand = float(v)
+                tag_used = tg
+                break
+
+        # fallback: forward-fill then actual
         if not np.isfinite(cand):
-            if h > 0 and np.isfinite(out[h-1]):
-                cand = out[h-1]
+            if h > 0 and np.isfinite(out[h - 1]):
+                cand = out[h - 1]
                 tag_used = "FWD"
             else:
-                # Still nothing? That means your DA/ST/RT aren’t stitched. Surface it.
-                raise RuntimeError(f"No forecast available for {a} at index {i} (h={h})")
+                v_act = state["actual"][a][i] if 0 <= i < len(state["actual"][a]) else np.nan
+                if np.isfinite(v_act):
+                    cand = float(v_act)
+                    tag_used = "ACT"
+                else:
+                    raise RuntimeError(f"No forecast available for {a} at index {i} (h={h})")
 
         out[h] = cand
         if h == 0:
@@ -433,7 +523,9 @@ def _load_da_matrix(area: str) -> tuple[np.ndarray, pd.DatetimeIndex]:
 # MPC (one step apply)
 # ----------------------------
 def run_mpc_step(tpos: int) -> dict:
-    H = min(MPC_H, len(state["timeline"]) - tpos)
+    mode = _mode_for_step(tpos)
+    state["active_mode"] = mode
+    H = min(MODE_CONFIG[mode]["horizon"], len(state["timeline"]) - tpos)
     dt = DT_HOURS
 
     model = pl.LpProblem("MPC_3layer", pl.LpMinimize)
@@ -466,7 +558,7 @@ def run_mpc_step(tpos: int) -> dict:
     # constraints over horizon
     for h in range(H):
         L_kw = state["total_load"][tpos+h] * 1000.0
-        floor_kw = _floor_per_area_kw(state["total_load"][tpos+h])
+        floor_kw = _floor_per_area_kw(state["total_load"][tpos+h], tpos+h)
 
         # battery dynamics
         for a in AREAS:
@@ -492,8 +584,14 @@ def run_mpc_step(tpos: int) -> dict:
         model += soc[(a,H)] >= max(E_MIN, E0 - down)
         model += soc[(a,H)] <= min(E_MAX, E0 + up)
 
+    # terminal SoC target soft tracking (avoid permanently staying at minimum)
+    soc_dev_pos = {a: pl.LpVariable(f"socdev_pos_{a}", lowBound=0) for a in AREAS}
+    soc_dev_neg = {a: pl.LpVariable(f"socdev_neg_{a}", lowBound=0) for a in AREAS}
+    for a in AREAS:
+        model += soc[(a,H)] - SOC_TARGET_KWH == soc_dev_pos[a] - soc_dev_neg[a]
+
     # objective
-    price_stack = {a: _price_for_horizon(a, tpos)[0] for a in AREAS}
+    price_stack = {a: _price_for_horizon(a, tpos, mode)[0] for a in AREAS}
     terms = []
     for h in range(H):
         for a in AREAS:
@@ -505,6 +603,7 @@ def run_mpc_step(tpos: int) -> dict:
             terms.append(-(p_exp[h] * (dt * SELL_PRICE_PER_MWH / 1000.0)))
     for a in AREAS:
         terms.append(HYSTERESIS_PENALTY * (v_pos[a] + v_neg[a]))
+        terms.append(SOC_TRACK_PENALTY_PER_KWH * (soc_dev_pos[a] + soc_dev_neg[a]))
     model += pl.lpSum(terms)
 
     model.solve(pl.PULP_CBC_CMD(msg=0))
@@ -537,11 +636,12 @@ def run_mpc_step(tpos: int) -> dict:
     step_forecast_0 = {}
     step_forecast_src = {}
     for a in AREAS:
-        vec, src0 = _price_for_horizon(a, tpos)
+        vec, src0 = _price_for_horizon(a, tpos, mode)
         step_forecast_0[a] = float(vec[0])
         step_forecast_src[a] = src0
     state["last_forecast_price"] = step_forecast_0
     state["last_forecast_src"]   = step_forecast_src
+    prediction_window = {a: SOURCE_TO_WINDOW.get(step_forecast_src[a], "unknown") for a in AREAS}
 
     # costs (step)
     dt_energy = DT_HOURS / 1000.0
@@ -575,6 +675,24 @@ def run_mpc_step(tpos: int) -> dict:
         "step_cost_equal_forecast": step_cost_equal_forecast,
         "step_cost_actual": step_cost_actual,
         "step_cost_equal_actual": step_cost_equal_actual,
+        "areaPriceForecast": step_forecast_0,
+        "areaPriceActual": {
+            a: float(state["actual"][a][tpos]) if np.isfinite(state["actual"][a][tpos]) else float(step_forecast_0[a])
+            for a in AREAS
+        },
+        "forecastSource": step_forecast_src,
+        "predictionWindow": prediction_window,
+        "optimizationMode": mode,
+        "horizonSteps": H,
+        "stepCosts": {
+            "forecast_opt": step_cost_forecast,
+            "forecast_equal": step_cost_equal_forecast,
+            "forecast_savings": step_cost_equal_forecast - step_cost_forecast,
+            "realized_opt": step_cost_actual,
+            "realized_equal": step_cost_equal_actual,
+            "realized_savings": step_cost_equal_actual - step_cost_actual,
+            "degradation": deg_cost,
+        },
     })
     return result
 
@@ -614,6 +732,7 @@ def get_live():
     price_forecast = {a: float(state.get("last_forecast_price", {}).get(a, np.nan)) for a in AREAS}
     price_actual   = {a: float(state["actual"][a][t]) if a in state["actual"] and t < len(state["actual"][a]) and np.isfinite(state["actual"][a][t]) else np.nan for a in AREAS}
     price_src      = {a: state.get("last_forecast_src", {}).get(a, "?") for a in AREAS}
+    prediction_window = {a: SOURCE_TO_WINDOW.get(price_src[a], "unknown") for a in AREAS}
 
     W = 60
     payload = {
@@ -626,10 +745,19 @@ def get_live():
         "totalSavings": float(state["equal_cost_forecast"] - state["opt_cost_forecast"]),
         "realizedCost": float(state["opt_cost_actual"]),
         "realizedSavings": float(state["equal_cost_actual"] - state["opt_cost_actual"]),
+        "activeOptimizationMode": state.get("active_mode", "short"),
+        "modeSelection": state.get("mode_selection", "auto"),
+        "costComparison": {
+            "withForecast_forecastBasis": float(state["opt_cost_forecast"]),
+            "withoutForecast_forecastBasis": float(state["equal_cost_forecast"]),
+            "withForecast_actualBasis": float(state["opt_cost_actual"]),
+            "withoutForecast_actualBasis": float(state["equal_cost_actual"]),
+        },
         "perAreaLoad": last["area_load"],
         "areaPriceForecast": price_forecast,
         "areaPriceActual":   price_actual,
         "forecastSource":    price_src,
+        "predictionWindow":  prediction_window,
         "soc": {a: float(state["soc"][a]) / E_MAX * 100.0 for a in AREAS},
         "battery": last.get("battery", {"charge_kw":0,"discharge_kw":0,"net_kw":0}),
         "power_balance": last.get("power_balance", {}),
@@ -643,6 +771,8 @@ def get_live():
             "soc": {a: state["history_soc"][a][-W:] for a in AREAS},
             "area_load": {a: state["history_area_load"][a][-W:] for a in AREAS},
             "area_price": {a: state["history_area_price"][a][-W:] for a in AREAS},
+            "prediction_source": {a: state["history_prediction_source"][a][-W:] for a in AREAS},
+            "mode": state["history_mode"][-W:],
         },
         "current": {
             "perAreaLoadMW": last["area_load"],
@@ -660,10 +790,32 @@ def get_live():
             "battery": last.get("battery", {}),
             "power_balance": last.get("power_balance", {}),
             "time": time_obj,
+            "forecastSource": price_src,
+            "predictionWindow": prediction_window,
+            "optimizationMode": state.get("active_mode", "short"),
         },
         "previous": state["history"][-2] if len(state["history"]) >= 2 else None,
     }
     return JSONResponse(payload)
+
+
+@app.get("/api/mode")
+def get_mode():
+    return JSONResponse({
+        "modeSelection": state.get("mode_selection", "auto"),
+        "activeMode": state.get("active_mode", "short"),
+        "availableModes": ["auto", "short", "medium", "long"],
+        "modeConfig": MODE_CONFIG,
+    })
+
+
+@app.post("/api/mode/{mode}")
+def set_mode(mode: str):
+    mode = mode.lower().strip()
+    if mode not in {"auto", "short", "medium", "long"}:
+        return JSONResponse({"status": "error", "message": f"Invalid mode '{mode}'"}, status_code=400)
+    state["mode_selection"] = mode
+    return JSONResponse({"status": "ok", "modeSelection": mode})
 
 # ----------------------------
 # Simulation loop (forever; 5s = 5min)
@@ -699,11 +851,13 @@ def simulate_loop():
             state["history_total_savings_forecast"].append(float(state["equal_cost_forecast"] - state["opt_cost_forecast"]))
             state["history_total_cost_actual"].append(float(state["opt_cost_actual"]))
             state["history_total_savings_actual"].append(float(state["equal_cost_actual"] - state["opt_cost_actual"]))
+            state["history_mode"].append(state.get("active_mode", "short"))
             for a in AREAS:
                 state["history_soc"][a].append(float(state["soc"][a]) / E_MAX * 100.0)
                 state["history_area_load"][a].append(float(res["area_load"][a]))
                 # record the forecast price used at this step (h=0)
                 state["history_area_price"][a].append(float(state["last_forecast_price"][a]))
+                state["history_prediction_source"][a].append(state["last_forecast_src"][a])
 
             # advance 1 step; loop forever
             state["idx"] = (t + 1) % len(state["timeline"])
