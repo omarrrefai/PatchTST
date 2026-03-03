@@ -139,3 +139,6 @@ mse:0.33338382840156555, mae:0.12891672551631927, rse:0.3950731158256531
 PTST_CAN_timeonly_tmulti_Quebec_X2Y_PatchTST_custom_ftM_sl576_ll72_pl12_dm512_nh8_el3_dl2_df2048_fc1_ebfixed_dtTrue_test_0  
 mse:0.34884852170944214, mae:0.14446039497852325, rse:0.40302571654319763
 
+PTST_CAN_features_t+1_manitoba_PatchTST_custom_ftM_sl576_ll72_pl1_dm512_nh8_el3_dl2_df2048_fc1_ebfixed_dtTrue_test_0  
+mse:0.21140724420547485, mae:0.05357549339532852, rse:0.28294143080711365
+
